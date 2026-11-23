@@ -1,5 +1,5 @@
 """
-AutoRoto CoTracker GPU Backend (tracker_core.py)
+AlphaToRoto CoTracker GPU Backend (tracker_core.py)
 Dedicated Meta CoTracker 3 offline deep learning point tracking backend.
 Uses PyTorch + CUDA (NVIDIA GeForce RTX 4080) for bidirectional zero-drift tracking.
 """

@@ -1,0 +1,115 @@
+{
+  "table1_parametric_conversion": [
+    {
+      "Method": "RDP Polygon Vectorization",
+      "Points_N": 33.2,
+      "J_percent": 99.06,
+      "F_percent": 100.0,
+      "J_and_F_percent": 99.53,
+      "Time_ms": 1.02
+    },
+    {
+      "Method": "SAM 2 Auto-Trace (Nuke)",
+      "Points_N": 58.2,
+      "J_percent": 99.2,
+      "F_percent": 99.78,
+      "J_and_F_percent": 99.49,
+      "Time_ms": 1.48
+    },
+    {
+      "Method": "Least-Squares B-Spline",
+      "Points_N": 26.0,
+      "J_percent": 99.64,
+      "F_percent": 100.0,
+      "J_and_F_percent": 99.82,
+      "Time_ms": 7.36
+    },
+    {
+      "Method": "Proposed Hermite-Bezier",
+      "Points_N": 18.4,
+      "J_percent": 96.56,
+      "F_percent": 91.06,
+      "J_and_F_percent": 93.81,
+      "Time_ms": 4.07
+    }
+  ],
+  "table2_dynamic_tracking_and_nom": [
+    {
+      "Method": "Frame-wise SAM 2 + RDP",
+      "NoM": 104,
+      "T_Flicker": 33.28,
+      "dJ_100": 4.11,
+      "Gap_percent": 0.0,
+      "FPS": 1220.5
+    },
+    {
+      "Method": "Single-Shape Unidirectional",
+      "NoM": 35,
+      "T_Flicker": 1.39,
+      "dJ_100": 18.46,
+      "Gap_percent": 0.0,
+      "FPS": 437.3
+    },
+    {
+      "Method": "Single-Shape Bidirectional",
+      "NoM": 35,
+      "T_Flicker": 1.39,
+      "dJ_100": 17.48,
+      "Gap_percent": 0.0,
+      "FPS": 457.2
+    },
+    {
+      "Method": "Proposed Part + Single-Ref",
+      "NoM": 22,
+      "T_Flicker": 1.6,
+      "dJ_100": 9.64,
+      "Gap_percent": 0.0,
+      "FPS": 263.8
+    },
+    {
+      "Method": "Proposed AlphaToRoto (Multi-Ref)",
+      "NoM": 3,
+      "T_Flicker": 1.6,
+      "dJ_100": 9.74,
+      "Gap_percent": 0.0,
+      "FPS": 255.6
+    }
+  ],
+  "table3_ablation_study": [
+    {
+      "Configuration": "w/o Kinematic-Geometric Part Decomp.",
+      "NoM": 25,
+      "J_and_F_percent": 85.39,
+      "Gap_percent": 0.0,
+      "RMSE_px": 3.84
+    },
+    {
+      "Configuration": "w/o Seam Overlap Margin (0 px)",
+      "NoM": 11,
+      "J_and_F_percent": 87.86,
+      "Gap_percent": 0.39,
+      "RMSE_px": 24.2
+    },
+    {
+      "Configuration": "w/o Visibility Weighting (Linear)",
+      "NoM": 35,
+      "J_and_F_percent": 92.02,
+      "Gap_percent": 0.0,
+      "RMSE_px": 2.43
+    },
+    {
+      "Configuration": "w/o Chord-Aligned Tangent Rotation",
+      "NoM": 35,
+      "J_and_F_percent": 91.2,
+      "Gap_percent": 0.0,
+      "RMSE_px": 2.49
+    },
+    {
+      "Configuration": "Full Proposed AlphaToRoto (10-15 px)",
+      "NoM": 15,
+      "J_and_F_percent": 92.69,
+      "Gap_percent": 0.0,
+      "RMSE_px": 3.33
+    }
+  ]
+}

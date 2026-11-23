@@ -1,10 +1,10 @@
 """
-AutoRoto Nuke Bridge (nuke_bridge.py)
+AlphaToRoto Nuke Bridge (nuke_bridge.py)
 Direct integration with Nuke Roto / RotoPaint API (nuke.roto / _rotopaint).
 Provides:
   1. Fix for RotoKnob rootLayer access across all Nuke versions.
   2. Roto node cloning with Tracker-style VCR buttons & properties.
-  3. CoTracker 3 GPU point tracking callbacks directly from the Roto node.
+  3. CoTracker 3 GPU point tracking callbacks & Stage 1-4 Alpha-to-Roto conversion directly from the Roto node.
 """
 
 import os
@@ -435,6 +435,36 @@ class NukeRotoBridge:
             p = os.path.join(temp_dir, f"frame_{f:04d}.jpg")
             if not os.path.exists(p):
                 raise FileNotFoundError(f"Rendered frame not found: {p}")
+            paths.append(p)
+
+        return paths, temp_dir
+
+    def export_source_rgba_frames(self, source_node, start_f: int, end_f: int) -> Tuple[List[str], Optional[str]]:
+        """
+        Renders 8-bit RGBA PNG frames for the specified frame range using Nuke's native Write node
+        so both alpha masks and RGB channels can be processed by AutoRoto Stage 1-4 conversion.
+        """
+        base_cache = get_nuke_cache_temp_dir()
+        temp_dir = tempfile.mkdtemp(prefix="autoroto_rgba_", dir=base_cache)
+        pattern = os.path.join(temp_dir, "rgba_%04d.png").replace("\\", "/")
+
+        write_node = nuke.nodes.Write(
+            inputs=[source_node],
+            file=pattern,
+            file_type="png",
+            channels="rgba"
+        )
+
+        try:
+            nuke.execute(write_node, start_f, end_f, 1)
+        finally:
+            nuke.delete(write_node)
+
+        paths = []
+        for f in range(start_f, end_f + 1):
+            p = os.path.join(temp_dir, f"rgba_{f:04d}.png")
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Rendered RGBA frame not found: {p}")
             paths.append(p)
 
         return paths, temp_dir
@@ -1100,7 +1130,7 @@ def make_autoroto_first_tab(node_name: Optional[str] = None, focus: bool = False
                     auto_idx = -1
                     for i in range(count):
                         t = w.tabText(i).replace('&', '').strip()
-                        if 'AutoRoto' in t:
+                        if 'AutoRoto' in t or 'AlphaToRoto' in t:
                             auto_idx = i
                             break
                     if auto_idx != -1:
@@ -1221,15 +1251,15 @@ def setup_autoroto_knobs(node):
         make_autoroto_first_tab(node.name())
         return
 
-    # 1. Dedicated AutoRoto Tab (Positioned as Tab 1 via moveTab)
-    tab = nuke.Tab_Knob('AutoRoto', 'AutoRoto')
+    # 1. Dedicated AlphaToRoto Tab (Positioned as Tab 1 via moveTab)
+    tab = nuke.Tab_Knob('AutoRoto', 'AlphaToRoto')
     node.addKnob(tab)
 
     # 2. Header
     title = nuke.Text_Knob(
         'ar_title', '',
-        '<font size=4 color="#e58934"><b>AutoRoto</b></font> '
-        '<font color="#888">CoTracker3 GPU</font>'
+        '<font size=4 color="#e58934"><b>AlphaToRoto</b></font> '
+        '<font color="#888">CoTracker3 GPU &amp; Parametric Bezier Conversion</font>'
     )
     node.addKnob(title)
 
@@ -1347,6 +1377,45 @@ def setup_autoroto_knobs(node):
     btn_fix_tangents.setTooltip('Cleans corrupted Bezier tangent handles and restores crisp curvature matching reference frame, instantly eliminating loops.')
     node.addKnob(btn_fix_tangents)
 
+    # 5b. Stage 1-4: Alpha Mask -> Multi-Part Hermite-Bezier Roto Conversion
+    node.addKnob(nuke.Text_Knob('ar_div_alpha', '', '<b><font color="#56B4E9">Alpha Mask ➔ Editable Bezier Roto (Stage 1–4)</font></b>'))
+
+    k_max_parts = nuke.Int_Knob('ar_max_parts', 'Max Parts')
+    k_max_parts.setValue(3)
+    k_max_parts.setRange(1, 6)
+    k_max_parts.setTooltip('Maximum quasi-rigid parts to decompose at concavity pinch points (Eq. 2). Set 1 for single closed loop.')
+    node.addKnob(k_max_parts)
+
+    k_overlap = nuke.Int_Knob('ar_overlap_px', 'Seam Overlap (px)')
+    k_overlap.setValue(12)
+    k_overlap.setRange(0, 25)
+    k_overlap.setTooltip('Internal seam overlap margin (10-15 px, default 12 px) so part-level edits never open internal gaps.')
+    k_overlap.clearFlag(nuke.STARTLINE)
+    node.addKnob(k_overlap)
+
+    k_max_pts = nuke.Int_Knob('ar_max_pts', 'Max Points / Part')
+    k_max_pts.setValue(16)
+    k_max_pts.setRange(6, 32)
+    k_max_pts.setTooltip('Maximum sparse cubic Bezier control points per part (O(N) Hermite-Bezier closed-form conversion, Eqs. 3-5).')
+    node.addKnob(k_max_pts)
+
+    k_mask_chan = nuke.Enumeration_Knob('ar_mask_channel', 'Mask Source', ['alpha (Input RGBA/Alpha)', 'luminance (Input RGB/BW)'])
+    k_mask_chan.setValue('alpha (Input RGBA/Alpha)')
+    k_mask_chan.clearFlag(nuke.STARTLINE)
+    node.addKnob(k_mask_chan)
+
+    btn_convert_mask = nuke.PyScript_Knob(
+        'ar_convert_mask', '<b><font color="#56B4E9">✨ Convert Input Alpha Mask to Editable Multi-Part Roto</font></b>',
+        'import nuke_bridge; nuke_bridge.on_node_convert_alpha_to_roto(nuke.thisNode())'
+    )
+    btn_convert_mask.setTooltip(
+        'Executes Stage 1 (Master Frame Selection) -> Stage 2 (Kinematic-Geometric Part Decomposition + 12px Overlap) '
+        '-> Stage 3 (O(N) Hermite-Bezier Handle Synthesis) -> Stage 4 (Fixed-Topology Propagation) and injects '
+        'editable multi-part Bezier shapes directly into this Roto node.'
+    )
+    btn_convert_mask.setFlag(nuke.STARTLINE)
+    node.addKnob(btn_convert_mask)
+
     # 6. Utilities & Status
     node.addKnob(nuke.Text_Knob('ar_div2', ''))
 
@@ -1398,7 +1467,7 @@ def create_autoroto_node():
         pass
 
     node = nuke.createNode('Roto')
-    node.setName('AutoRoto1')
+    node.setName('AlphaToRoto1')
     if sel:
         try:
             node.setInput(0, sel)
@@ -1409,6 +1478,9 @@ def create_autoroto_node():
     hide_intermediate_native_tabs(node)
     make_autoroto_first_tab(node.name(), focus=True)
     return node
+
+
+create_alphatoroto_node = create_autoroto_node
 
 
 def add_autoroto_to_selected():
@@ -2080,6 +2152,139 @@ def _run_multi_reference_tracking(roto_node, ref_frames: List[int], start_f: int
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     return summary
+
+
+def on_node_convert_alpha_to_roto(roto_node):
+    """
+    Executes Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 from `autoroto_pipeline.py` directly on the
+    input node connected to `roto_node`:
+      1. Renders input RGBA/Luminance frames across [Start Frame, End Frame]
+      2. Stage 1: Selects optimal Master Reference Frame F_master (Eq. 1)
+      3. Stage 2: Decomposes mask into quasi-rigid parts with 10-15 px Seam Overlap Margin (Eq. 2)
+      4. Stage 3: Synthesizes O(N) closed-form Hermite-to-Bezier control points & handles (Eqs. 3-5)
+      5. Stage 4: Propagates fixed-topology control points with C1 blending & tangent rotation (Eqs. 6-8)
+      6. Injects the animated multi-part cubic Bezier shapes into `roto_node` and updates `Ref Frame`.
+    """
+    source_node = roto_node.input(0)
+    if not source_node:
+        nuke.message(f"Please connect an Alpha Mask or RGBA sequence to the input of '{roto_node.name()}'.")
+        return None
+
+    start_f = int(roto_node['ar_start_frame'].value()) if roto_node.knob('ar_start_frame') else int(nuke.root()['first_frame'].value())
+    end_f = int(roto_node['ar_end_frame'].value()) if roto_node.knob('ar_end_frame') else int(nuke.root()['last_frame'].value())
+    if start_f > end_f:
+        nuke.message("Start Frame must be <= End Frame.")
+        return None
+
+    max_parts = int(roto_node['ar_max_parts'].value()) if roto_node.knob('ar_max_parts') else 3
+    overlap_px = int(roto_node['ar_overlap_px'].value()) if roto_node.knob('ar_overlap_px') else 12
+    max_pts = int(roto_node['ar_max_pts'].value()) if roto_node.knob('ar_max_pts') else 16
+    key_step = int(roto_node['ar_key_step'].value()) if roto_node.knob('ar_key_step') else 1
+    mask_chan = roto_node['ar_mask_channel'].value() if roto_node.knob('ar_mask_channel') else 'alpha'
+    use_alpha = 'alpha' in str(mask_chan).lower()
+
+    try:
+        src_fmt = source_node.format()
+        roto_fmt = roto_node.format()
+        if roto_fmt.width() != src_fmt.width() or roto_fmt.height() != src_fmt.height():
+            roto_node['format'].setValue(src_fmt.name())
+    except Exception:
+        pass
+
+    bridge = NukeRotoBridge()
+    total_frames = end_f - start_f + 1
+    progress = nuke.ProgressTask("AutoRoto: Converting Alpha Mask to Multi-Part Bezier Roto...")
+    progress.setProgress(5)
+    progress.setMessage(f"Exporting {total_frames} RGBA frames from Nuke...")
+
+    temp_dir = None
+    try:
+        import cv2
+        import numpy as np
+        from autoroto_pipeline import AutoRotoPipeline
+
+        rgba_paths, temp_dir = bridge.export_source_rgba_frames(source_node, start_f, end_f)
+        if progress.isCancelled():
+            raise RuntimeError("Conversion cancelled by user.")
+
+        progress.setProgress(30)
+        progress.setMessage("Loading alpha masks and RGB frames...")
+        masks = []
+        frames_rgb = []
+        frame_numbers = list(range(start_f, end_f + 1))
+
+        for p in rgba_paths:
+            img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise RuntimeError(f"Failed to read exported frame: {p}")
+            if img.ndim == 3 and img.shape[2] == 4:
+                rgb = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+                alpha = img[:, :, 3] if use_alpha else cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+                # Fallback to luminance if alpha channel is completely solid white or empty
+                if use_alpha and (np.all(alpha == 255) or np.all(alpha == 0)):
+                    alpha = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+            elif img.ndim == 3:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                alpha = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                alpha = img
+
+            masks.append(((alpha > 127).astype(np.uint8) * 255))
+            frames_rgb.append(rgb)
+
+        progress.setProgress(55)
+        progress.setMessage("Running Stage 1-4 AutoRoto Pipeline (Master Frame, Part Decomp, Hermite-Bezier)...")
+
+        pipeline = AutoRotoPipeline(
+            overlap_margin_px=overlap_px,
+            max_parts=max_parts,
+            min_points_per_part=8,
+            max_points_per_part=max_pts,
+        )
+        project = pipeline.build_editable_roto_from_masks(
+            masks, frames_rgb=frames_rgb, frame_numbers=frame_numbers
+        )
+
+        progress.setProgress(85)
+        progress.setMessage("Injecting multi-part cubic Bezier shapes into Roto node...")
+        pipeline.inject_into_nuke_roto_node(project, roto_node=roto_node, key_step=max(1, key_step))
+
+        master_f = int(project["master_frame"])
+        if roto_node.knob('ar_ref_frame'):
+            roto_node['ar_ref_frame'].setValue(str(master_f))
+
+        num_parts = len(project["parts"])
+        total_pts = sum(p["num_control_points"] for p in project["parts"])
+        gap_pct = round(project["seam_gap_ratio_master"] * 100.0, 3)
+        msg = (
+            f"✓ Converted Alpha ➔ {num_parts} Bezier Part(s) ({total_pts} pts, Master Frame: {master_f}, "
+            f"Overlap: {overlap_px}px, Seam Gap: {gap_pct}%)"
+        )
+        if roto_node.knob('ar_status'):
+            roto_node['ar_status'].setValue(msg)
+        progress.setProgress(100)
+        nuke.message(
+            f"AutoRoto Stage 1–4 Conversion Complete!\n\n"
+            f"• Master Frame (Eq. 1): {master_f}\n"
+            f"• Decomposed Parts (Eq. 2): {num_parts} part(s) with {overlap_px} px seam overlap\n"
+            f"• Total Bezier Control Points (Eqs. 3–5): {total_pts}\n"
+            f"• Internal Seam Gap: {gap_pct}%\n\n"
+            f"You can now edit control points on any frame and click '🚀 Track Full Range' "
+            f"for multi-reference C1 smoothstep re-tracking!"
+        )
+        return msg
+
+    except Exception as e:
+        err_msg = str(e)
+        if roto_node.knob('ar_status'):
+            roto_node['ar_status'].setValue(f"Error: {err_msg}")
+        nuke.message(f"AutoRoto Conversion Error:\n{err_msg}")
+        return None
+    finally:
+        del progress
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # Automatically apply tab move & VCR button sizing if Nuke GUI session is active

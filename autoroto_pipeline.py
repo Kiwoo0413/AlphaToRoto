@@ -1,5 +1,5 @@
 """
-Stage 4: End-to-End AutoRoto Human-in-the-Loop Conversion & Temporal Propagation Pipeline
+Stage 4: End-to-End AlphaToRoto Human-in-the-Loop Conversion & Temporal Propagation Pipeline
 Integrates:
   - Stage 1: Tracked Raster Alpha Mask Generation & Master Reference Frame Selection (Eq. 1)
   - Stage 2: Kinematic-Geometric Part Decomposition & 10-15 px Seam Overlap Margin (Eq. 2)
@@ -24,6 +24,7 @@ from hermite_bezier_converter import (
     contour_to_hermite_bezier,
     rasterize_bezier_shapes,
     compute_j_and_f_metrics,
+    compute_contour_rmse_px,
 )
 from nuke_bridge import blend_bidirectional_trajectories
 
@@ -93,12 +94,18 @@ def blend_multi_ref_tracks(
     ref_frames: List[int],
     start_f: int,
     end_f: int,
+    blending_mode: str = "c1_vis",
 ) -> Dict[int, Dict[int, Tuple[float, float, float]]]:
     """
     Combines trajectories propagated from one or more reference keyframes K = {k_1, ..., k_M}
     across [start_f, end_f] using piecewise C1 smoothstep visibility-weighted bidirectional
     blending (Equations 6 and 7) on each interval [k_m, k_{m+1}], and unidirectional
     propagation outside [k_1, k_M].
+
+    blending_mode:
+      - "c1_vis": Proposed C1 smoothstep s(t)=3t^2-2t^3 + visibility weighting (Eqs. 6-7)
+      - "linear": Ablation baseline w/o visibility weighting or C1 smoothstep (w_fwd=1-t, w_bwd=t)
+      - "unidirectional": Forward-only propagation from each reference keyframe
     """
     sorted_refs = sorted(ref_frames)
     first_ref = sorted_refs[0]
@@ -116,19 +123,44 @@ def blend_multi_ref_tracks(
             if f in tracks_per_ref[first_ref][pt_idx]:
                 combined[pt_idx][f] = tracks_per_ref[first_ref][pt_idx][f]
 
-    # 2. Intermediate intervals [k_m, k_{m+1}]: C1 smoothstep visibility-weighted blend
+    # 2. Intermediate intervals [k_m, k_{m+1}]
     for m in range(len(sorted_refs) - 1):
         k_start = sorted_refs[m]
         k_end = sorted_refs[m + 1]
-        interval_blend = blend_bidirectional_trajectories(
-            tracks_per_ref[k_start],
-            tracks_per_ref[k_end],
-            start_k=k_start,
-            end_k=k_end,
-        )
-        for pt_idx in all_pts:
-            for f, val in interval_blend.get(pt_idx, {}).items():
-                combined[pt_idx][f] = val
+        if blending_mode == "c1_vis":
+            interval_blend = blend_bidirectional_trajectories(
+                tracks_per_ref[k_start],
+                tracks_per_ref[k_end],
+                start_k=k_start,
+                end_k=k_end,
+            )
+            for pt_idx in all_pts:
+                for f, val in interval_blend.get(pt_idx, {}).items():
+                    combined[pt_idx][f] = val
+        elif blending_mode == "linear":
+            span = max(1, k_end - k_start)
+            for pt_idx in all_pts:
+                for f in range(k_start, k_end + 1):
+                    xf, yf, vf = tracks_per_ref[k_start][pt_idx][f]
+                    xb, yb, vb = tracks_per_ref[k_end][pt_idx][f]
+                    t = float(f - k_start) / float(span)
+                    if f == k_start:
+                        bx, by = xf, yf
+                    elif f == k_end:
+                        bx, by = xb, yb
+                    else:
+                        bx = (1.0 - t) * xf + t * xb
+                        by = (1.0 - t) * yf + t * yb
+                    combined[pt_idx][f] = (bx, by, max(float(vf), float(vb)))
+        elif blending_mode == "unidirectional":
+            for pt_idx in all_pts:
+                for f in range(k_start, k_end + 1):
+                    if f == k_end:
+                        combined[pt_idx][f] = tracks_per_ref[k_end][pt_idx][f]
+                    else:
+                        combined[pt_idx][f] = tracks_per_ref[k_start][pt_idx][f]
+        else:
+            raise ValueError(f"Unsupported blending_mode: {blending_mode}")
 
     # 3. Frames after last_ref: use forward track from last_ref
     for f in range(last_ref, end_f + 1):
@@ -273,10 +305,13 @@ def bake_part_frames_with_rotated_tangents(
     ref_keyframes_map: Dict[int, List[Dict[str, Any]]],
     blended_tracks: Dict[int, Dict[int, Tuple[float, float, float]]],
     frame_numbers: List[int],
+    use_tangent_rotation: bool = True,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """
     Applies Chord-Aligned Relative Tangent Rotation (Equation 8) across all frames while
     strictly preserving 100% of artist-edited reference keyframes in ref_keyframes_map.
+    When use_tangent_rotation=False (ablation study), tangent handles remain fixed to
+    the reference keyframe's initial handle offsets without chord rotation.
 
     Returns:
       { frame_num: List[control_point_schema_dict] }
@@ -329,8 +364,18 @@ def bake_part_frames_with_rotated_tangents(
             for i in range(num_pts)
         ]
 
-        # Eq. (8): Chord-aligned tangent rotation & scale clamping in [0.7, 1.4]
-        rotated_tangents = compute_rotated_tangents(ref_pts_for_bridge, curr_local_coords)
+        if use_tangent_rotation:
+            # Eq. (8): Chord-aligned tangent rotation & scale clamping in [0.7, 1.4]
+            rotated_tangents = compute_rotated_tangents(ref_pts_for_bridge, curr_local_coords)
+        else:
+            rotated_tangents = [
+                {
+                    "lt_rel": ref_pts_for_bridge[i]["lt_rel"],
+                    "rt_rel": ref_pts_for_bridge[i]["rt_rel"],
+                    "fc_rel": ref_pts_for_bridge[i]["fc_rel"],
+                }
+                for i in range(num_pts)
+            ]
 
         frame_schema: List[Dict[str, Any]] = []
         for i in range(num_pts):
@@ -353,9 +398,9 @@ def bake_part_frames_with_rotated_tangents(
     return baked_frames
 
 
-class AutoRotoPipeline:
+class AlphaToRotoPipeline:
     """
-    End-to-End Human-in-the-Loop Conversion System transforming tracked raster alpha masks
+    End-to-End AlphaToRoto Human-in-the-Loop Conversion System transforming tracked raster alpha masks
     into artist-editable, spatiotemporally consistent parametric cubic Bezier rotoscoping shapes.
     """
 
@@ -366,12 +411,18 @@ class AutoRotoPipeline:
         min_points_per_part: int = 8,
         max_points_per_part: int = 20,
         default_tension: float = 0.5,
+        blending_mode: str = "c1_vis",
+        use_tangent_rotation: bool = True,
+        use_contour_snapping: bool = True,
     ):
         self.overlap_margin_px = overlap_margin_px
         self.max_parts = max_parts
         self.min_points_per_part = min_points_per_part
         self.max_points_per_part = max_points_per_part
         self.default_tension = default_tension
+        self.blending_mode = blending_mode
+        self.use_tangent_rotation = use_tangent_rotation
+        self.use_contour_snapping = use_contour_snapping
 
     def build_editable_roto_from_masks(
         self,
@@ -437,17 +488,23 @@ class AutoRotoPipeline:
 
             # Build per-frame target masks for this part by intersecting or tracking
             ref_keyframes_map = {master_frame: master_bezier_cps}
+            part_masks_seq = (
+                masks
+                if len(decomp["parts"]) == 1
+                else [
+                    cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
+                    if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30
+                    else m
+                    for m in masks
+                ]
+            )
             raw_tracks_from_master = propagate_points_from_reference(
                 master_bezier_cps,
                 ref_frame=master_frame,
                 frame_numbers=frame_numbers,
-                masks=masks if len(decomp["parts"]) == 1 else [
-                    cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
-                    if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30 else m
-                    for m in masks
-                ],
+                masks=part_masks_seq,
                 frames_rgb=frames_rgb,
-                use_contour_snapping=True,
+                use_contour_snapping=self.use_contour_snapping,
             )
 
             tracks_per_ref = {master_frame: raw_tracks_from_master}
@@ -456,9 +513,13 @@ class AutoRotoPipeline:
                 ref_frames=[master_frame],
                 start_f=frame_numbers[0],
                 end_f=frame_numbers[-1],
+                blending_mode=self.blending_mode,
             )
             baked_frames = bake_part_frames_with_rotated_tangents(
-                ref_keyframes_map, blended_tracks, frame_numbers
+                ref_keyframes_map,
+                blended_tracks,
+                frame_numbers,
+                use_tangent_rotation=self.use_tangent_rotation,
             )
 
             parts_roto.append(
@@ -469,6 +530,7 @@ class AutoRotoPipeline:
                     "reference_keyframes": ref_keyframes_map,
                     "tracks_per_ref": tracks_per_ref,
                     "frames": baked_frames,
+                    "_part_master_mask": p_mask_master,
                 }
             )
 
@@ -529,54 +591,197 @@ class AutoRotoPipeline:
             for i, cp in enumerate(edited_control_points)
         ]
 
-        if masks is not None:
+        if masks is not None and len(part["reference_keyframes"]) == 1:
+            p_mask_master = part.get("_part_master_mask")
+            part_masks_seq = (
+                masks
+                if (len(roto_project["parts"]) == 1 or p_mask_master is None)
+                else [
+                    cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
+                    if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30
+                    else m
+                    for m in masks
+                ]
+            )
             new_ref_tracks = propagate_points_from_reference(
                 part["reference_keyframes"][edited_frame],
                 ref_frame=edited_frame,
                 frame_numbers=frame_numbers,
-                masks=masks,
+                masks=part_masks_seq,
                 frames_rgb=roto_project.get("_frames_rgb_ref"),
-                use_contour_snapping=False,
+                use_contour_snapping=self.use_contour_snapping,
             )
         else:
-            # Propagate relative delta offset from existing trajectory when raw masks are not attached
+            # Propagate artist delta offset from the existing tracked trajectory so unedited points
+            # keep their tracked/snapped precision while edited points propagate bidirectionally
+            master_ref = roto_project["master_frame"]
+            base_tracks = part["tracks_per_ref"].get(master_ref)
             new_ref_tracks = {i: {} for i in range(part["num_control_points"])}
             old_frame_cps = part["frames"][edited_frame]
             for i in range(part["num_control_points"]):
                 dx = float(edited_control_points[i]["anchor"][0]) - float(old_frame_cps[i]["anchor"][0])
                 dy = float(edited_control_points[i]["anchor"][1]) - float(old_frame_cps[i]["anchor"][1])
                 for f in frame_numbers:
-                    ox, oy = part["frames"][f][i]["anchor"]
-                    new_ref_tracks[i][f] = (float(ox + dx), float(oy + dy), 1.0)
+                    if base_tracks and f in base_tracks[i]:
+                        ox, oy, vis = base_tracks[i][f]
+                    else:
+                        ox, oy = part["frames"][f][i]["anchor"]
+                        vis = float(part["frames"][f][i].get("visibility", 1.0))
+                    # Confidence decays gently with temporal distance from edited_frame
+                    dist_f = abs(f - edited_frame)
+                    vis_edit = float(np.clip(vis * np.exp(-dist_f / 25.0), 0.1, 1.0))
+                    new_ref_tracks[i][f] = (float(ox + dx), float(oy + dy), vis_edit)
 
         part["tracks_per_ref"][edited_frame] = new_ref_tracks
         sorted_refs = sorted(part["reference_keyframes"].keys())
 
-        # Equations (6) & (7): Multi-Reference C1 Smoothstep Visibility-Weighted Blending
+        # Equations (6) & (7): Multi-Reference Blending (C1 Smoothstep + Visibility or ablation mode)
         blended_tracks = blend_multi_ref_tracks(
             part["tracks_per_ref"],
             ref_frames=sorted_refs,
             start_f=frame_numbers[0],
             end_f=frame_numbers[-1],
+            blending_mode=self.blending_mode,
         )
 
         # Equation (8) + Non-destructive keyframe locking
         part["frames"] = bake_part_frames_with_rotated_tangents(
-            part["reference_keyframes"], blended_tracks, frame_numbers
+            part["reference_keyframes"],
+            blended_tracks,
+            frame_numbers,
+            use_tangent_rotation=self.use_tangent_rotation,
         )
         return roto_project
 
     @staticmethod
+    def compute_temporal_flicker_T(roto_project: Dict[str, Any]) -> float:
+        """
+        Computes temporal instability / jitter T (Flicker, in px) as the mean second-order
+        temporal finite difference norm ||P_{t+1} - 2 P_t + P_{t-1}||_2 across all control
+        points and frames.
+        """
+        frame_numbers = roto_project["frame_numbers"]
+        if len(frame_numbers) < 3:
+            return 0.0
+
+        accel_norms = []
+        for p in roto_project["parts"]:
+            n_pts = p["num_control_points"]
+            for t_idx in range(1, len(frame_numbers) - 1):
+                f_prev = frame_numbers[t_idx - 1]
+                f_curr = frame_numbers[t_idx]
+                f_next = frame_numbers[t_idx + 1]
+                cps_prev = p["frames"][f_prev]
+                cps_curr = p["frames"][f_curr]
+                cps_next = p["frames"][f_next]
+                if len(cps_prev) != n_pts or len(cps_curr) != n_pts or len(cps_next) != n_pts:
+                    continue
+                for i in range(n_pts):
+                    p0 = np.array(cps_prev[i]["anchor"], dtype=np.float64)
+                    p1 = np.array(cps_curr[i]["anchor"], dtype=np.float64)
+                    p2 = np.array(cps_next[i]["anchor"], dtype=np.float64)
+                    accel = p2 - 2.0 * p1 + p0
+                    accel_norms.append(float(np.hypot(accel[0], accel[1])))
+
+        return float(np.mean(accel_norms)) if accel_norms else 0.0
+
+    @staticmethod
+    def compute_sequence_seam_gap_percent(
+        roto_project: Dict[str, Any],
+        gt_masks: List[np.ndarray],
+    ) -> float:
+        """
+        Computes the internal seam gap ratio (%) across the sequence when multi-part Bezier
+        shapes are rasterized and compared against the interior cut zone of gt_masks.
+        """
+        if len(roto_project["parts"]) <= 1 or not roto_project.get("cut_lines"):
+            return float(roto_project.get("seam_gap_ratio_master", 0.0) * 100.0)
+
+        h, w = roto_project["height"], roto_project["width"]
+        frame_numbers = roto_project["frame_numbers"]
+        gap_ratios = [float(roto_project.get("seam_gap_ratio_master", 0.0))]
+
+        # Build a 14-px band mask around cut lines to measure internal seam gaps across frames
+        cut_band = np.zeros((h, w), dtype=np.uint8)
+        for cut in roto_project["cut_lines"]:
+            cv2.line(cut_band, tuple(cut["p1"]), tuple(cut["p2"]), 255, thickness=12)
+
+        for idx, f_num in enumerate(frame_numbers):
+            gt_m = (gt_masks[idx] > 127).astype(np.uint8) * 255
+            total_fg = int(np.count_nonzero(gt_m))
+            if total_fg == 0:
+                continue
+            # Erode outer boundary by 5 px so only internal seam gaps (not outer contour curvature) are measured
+            interior_fg = cv2.erode(gt_m, np.ones((9, 9), np.uint8))
+            schemas = [p["frames"][f_num] for p in roto_project["parts"]]
+            pred_union = rasterize_bezier_shapes(schemas, h, w)
+            seam_zone_fg = (interior_fg > 0) & (cut_band > 0)
+            missing_in_seam = np.count_nonzero(seam_zone_fg & (pred_union == 0))
+            gap_ratios.append(float(missing_in_seam) / float(total_fg))
+
+        return float(np.mean(gap_ratios) * 100.0)
+
+    @classmethod
+    def evaluate_sequence_metrics(
+        cls,
+        roto_project: Dict[str, Any],
+        gt_masks: List[np.ndarray],
+    ) -> Dict[str, float]:
+        """
+        Evaluates full sequence metrics for Tables 1, 2, and 3:
+          - J (%): mean region similarity (IoU)
+          - F (%): mean boundary F-score
+          - J_and_F (%): mean (J + F) / 2
+          - RMSE_px: mean contour Root Mean Squared Error in pixels
+          - T_flicker: temporal second-order acceleration jitter
+          - dJ_decay: long-term J decay from reference keyframe to sequence end
+          - Gap_percent: internal seam gap percentage
+        """
+        h, w = roto_project["height"], roto_project["width"]
+        frame_numbers = roto_project["frame_numbers"]
+        j_list, f_list, jf_list, rmse_list = [], [], [], []
+
+        for idx, f_num in enumerate(frame_numbers):
+            schemas = [p["frames"][f_num] for p in roto_project["parts"]]
+            pred_m = rasterize_bezier_shapes(schemas, h, w)
+            m = compute_j_and_f_metrics(pred_m, gt_masks[idx])
+            rmse = compute_contour_rmse_px(schemas, gt_masks[idx])
+            j_list.append(m["J"])
+            f_list.append(m["F"])
+            jf_list.append(m["J_and_F"])
+            rmse_list.append(rmse)
+
+        master_idx = int(roto_project.get("master_index", 0))
+        j_ref = j_list[master_idx] if 0 <= master_idx < len(j_list) else j_list[0]
+        # Measure drift against worst/furthest boundary frame
+        j_end = min(j_list[0], j_list[-1])
+        dj_decay = max(0.0, float(j_ref - j_end))
+
+        return {
+            "J": float(np.mean(j_list)),
+            "F": float(np.mean(f_list)),
+            "J_and_F": float(np.mean(jf_list)),
+            "RMSE_px": float(np.mean(rmse_list)),
+            "T_flicker": cls.compute_temporal_flicker_T(roto_project),
+            "dJ_decay": dj_decay,
+            "Gap_percent": cls.compute_sequence_seam_gap_percent(roto_project, gt_masks),
+        }
+
     def simulate_oracle_editability_nom(
+        self,
         roto_project: Dict[str, Any],
         gt_masks: List[np.ndarray],
         target_f_score: float = 90.0,
         max_modifications: int = 30,
+        propagate_keyframe_edits: bool = False,
     ) -> Dict[str, Any]:
         """
         Simulates an Oracle Artist Agent that iteratively identifies the control point with the
         largest distance to the ground-truth contour and drags it to the true contour boundary
         until the sequence boundary accuracy F >= target_f_score.
+        When propagate_keyframe_edits=True, editing a control point on a keyframe triggers
+        multi-reference bidirectional C1 smoothstep blending (apply_artist_keyframe_edit)
+        so intermediate frames benefit from the artist's correction.
 
         Returns:
           {
@@ -603,13 +808,19 @@ class AutoRotoPipeline:
         init_f = float(np.mean([m["F"] for m in init_metrics]))
 
         nom_count = 0
-        for f_idx, f_num in enumerate(frame_numbers):
-            gt_c = extract_ordered_contour(gt_masks[f_idx], smooth_sigma=0.5)
-            if len(gt_c) == 0:
-                continue
-            m_curr = _eval_frame(f_idx)
-            while m_curr["F"] < target_f_score and nom_count < max_modifications:
-                # Find control point across all parts with largest deviation from gt_c
+        if propagate_keyframe_edits:
+            # Iterative multi-ref keyframe oracle: always pick the worst frame in the sequence
+            while nom_count < max_modifications:
+                curr_metrics = [_eval_frame(i) for i in range(len(frame_numbers))]
+                worst_f_idx = int(np.argmin([m["F"] for m in curr_metrics]))
+                if curr_metrics[worst_f_idx]["F"] >= target_f_score:
+                    break
+
+                f_num = frame_numbers[worst_f_idx]
+                gt_c = extract_ordered_contour(gt_masks[worst_f_idx], smooth_sigma=0.5)
+                if len(gt_c) == 0:
+                    break
+
                 worst_dist = -1.0
                 worst_part = None
                 worst_pt_idx = -1
@@ -629,13 +840,58 @@ class AutoRotoPipeline:
                 if worst_part is None or worst_dist < 1.0:
                     break
 
-                # Oracle drags worst control point to true contour boundary
-                worst_part["frames"][f_num][worst_pt_idx]["anchor"] = [
+                edited_cps = [
+                    {
+                        "index": cp["index"],
+                        "anchor": list(cp["anchor"]),
+                        "in_handle": list(cp["in_handle"]),
+                        "out_handle": list(cp["out_handle"]),
+                    }
+                    for cp in worst_part["frames"][f_num]
+                ]
+                edited_cps[worst_pt_idx]["anchor"] = [
                     float(best_target_xy[0]),
                     float(best_target_xy[1]),
                 ]
+                self.apply_artist_keyframe_edit(
+                    roto_project,
+                    part_id=worst_part["part_id"],
+                    edited_frame=f_num,
+                    edited_control_points=edited_cps,
+                )
                 nom_count += 1
+        else:
+            for f_idx, f_num in enumerate(frame_numbers):
+                gt_c = extract_ordered_contour(gt_masks[f_idx], smooth_sigma=0.5)
+                if len(gt_c) == 0:
+                    continue
                 m_curr = _eval_frame(f_idx)
+                while m_curr["F"] < target_f_score and nom_count < max_modifications:
+                    worst_dist = -1.0
+                    worst_part = None
+                    worst_pt_idx = -1
+                    best_target_xy = None
+
+                    for p in roto_project["parts"]:
+                        for cp in p["frames"][f_num]:
+                            pt = np.array(cp["anchor"], dtype=np.float64)
+                            dists = np.hypot(gt_c[:, 0] - pt[0], gt_c[:, 1] - pt[1])
+                            min_d_idx = int(np.argmin(dists))
+                            if dists[min_d_idx] > worst_dist:
+                                worst_dist = float(dists[min_d_idx])
+                                worst_part = p
+                                worst_pt_idx = cp["index"]
+                                best_target_xy = gt_c[min_d_idx]
+
+                    if worst_part is None or worst_dist < 1.0:
+                        break
+
+                    worst_part["frames"][f_num][worst_pt_idx]["anchor"] = [
+                        float(best_target_xy[0]),
+                        float(best_target_xy[1]),
+                    ]
+                    nom_count += 1
+                    m_curr = _eval_frame(f_idx)
 
         final_metrics = [_eval_frame(i) for i in range(len(frame_numbers))]
         final_j = float(np.mean([m["J"] for m in final_metrics]))
@@ -653,11 +909,17 @@ class AutoRotoPipeline:
     @staticmethod
     def export_to_json(roto_project: Dict[str, Any], output_json_path: str):
         """Exports the parametric cubic Bezier Roto project to a clean JSON file."""
-        serializable = {
-            k: v
-            for k, v in roto_project.items()
-            if not k.startswith("_")
-        }
+        serializable = {}
+        for k, v in roto_project.items():
+            if k.startswith("_"):
+                continue
+            if k == "parts":
+                serializable["parts"] = [
+                    {pk: pv for pk, pv in p.items() if not pk.startswith("_")}
+                    for p in v
+                ]
+            else:
+                serializable[k] = v
         os.makedirs(os.path.dirname(os.path.abspath(output_json_path)), exist_ok=True)
         with open(output_json_path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2, ensure_ascii=False)
@@ -809,7 +1071,7 @@ class AutoRotoPipeline:
         payload_json = json.dumps(serializable)
 
         script = f'''"""
-Auto-generated Foundry Nuke Roto Node Builder Script (AutoRoto)
+Auto-generated Foundry Nuke Roto Node Builder Script (AlphaToRoto)
 Run inside Nuke Script Editor to instantiate the artist-editable multi-part Bezier Roto node.
 """
 import json
@@ -818,9 +1080,9 @@ import nuke.rotopaint as rp
 
 ROTO_DATA = json.loads({repr(payload_json)})
 
-def build_autoroto_node(key_step={int(key_step)}):
+def build_alphatoroto_node(key_step={int(key_step)}):
     roto_node = nuke.createNode("Roto", inpanel=False)
-    roto_node.setName("AutoRoto_EditableParts")
+    roto_node.setName("AlphaToRoto_EditableParts")
     curves_knob = roto_node["curves"]
     root_layer = getattr(curves_knob, "rootLayer", getattr(curves_knob, "root", None))
     h = float(ROTO_DATA["height"])
@@ -859,9 +1121,15 @@ def build_autoroto_node(key_step={int(key_step)}):
     curves_knob.changed()
     return roto_node
 
+build_autoroto_node = build_alphatoroto_node
+
 if __name__ == "__main__":
-    build_autoroto_node()
+    build_alphatoroto_node()
 '''
         os.makedirs(os.path.dirname(os.path.abspath(output_py_path)), exist_ok=True)
         with open(output_py_path, "w", encoding="utf-8") as f:
             f.write(script)
+
+
+# Backwards-compatibility alias
+AutoRotoPipeline = AlphaToRotoPipeline

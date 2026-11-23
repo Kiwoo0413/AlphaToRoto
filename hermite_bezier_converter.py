@@ -378,3 +378,230 @@ def mask_to_hermite_bezier_shape(
         "reconstructed_mask": recon_mask,
         "metrics": metrics,
     }
+
+
+def compute_contour_rmse_px(
+    shapes_schemas: List[List[Dict[str, Any]]],
+    gt_mask: np.ndarray,
+    samples_per_segment: int = 24,
+) -> float:
+    """
+    Computes the symmetric Root Mean Squared Error (RMSE in pixels) between the evaluated
+    parametric cubic Bezier curves of all parts (outer boundary) and the ground-truth mask contour.
+    """
+    gt_contour = extract_ordered_contour(gt_mask, smooth_sigma=0.5)
+    if len(gt_contour) == 0 or not shapes_schemas:
+        return 0.0
+
+    h, w = gt_mask.shape[:2]
+    pred_mask = rasterize_bezier_shapes(
+        shapes_schemas, h, w, samples_per_segment=samples_per_segment
+    )
+    pred_contour = extract_ordered_contour(pred_mask, smooth_sigma=0.5)
+    if len(pred_contour) == 0:
+        return float(np.hypot(h, w))
+
+    # Distance from each predicted boundary point to nearest GT contour point and vice versa
+    diff_p2g = pred_contour[:, None, :] - gt_contour[None, :, :]
+    dist_p2g = np.min(np.hypot(diff_p2g[:, :, 0], diff_p2g[:, :, 1]), axis=1)
+
+    diff_g2p = gt_contour[:, None, :] - pred_contour[None, :, :]
+    dist_g2p = np.min(np.hypot(diff_g2p[:, :, 0], diff_g2p[:, :, 1]), axis=1)
+
+    all_sq = np.concatenate([dist_p2g ** 2, dist_g2p ** 2])
+    return float(np.sqrt(np.mean(all_sq)))
+
+
+def rdp_polygon_vectorize(
+    mask: np.ndarray,
+    epsilon_ratio: float = 0.0022,
+    target_num_points: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Baseline 1 (Table 1): RDP Polygon Vectorization (cv2.approxPolyDP).
+    Produces piecewise linear polygon vertices (zero tangent handles: in_handle=[0,0], out_handle=[0,0]).
+    Requires a much denser vertex count N to approximate curved boundaries without tangent handles.
+    """
+    h, w = mask.shape[:2]
+    bin_mask = (mask > 127).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(bin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return {"num_control_points": 0, "control_points": [], "reconstructed_mask": np.zeros_like(bin_mask), "metrics": {"J": 0.0, "F": 0.0, "J_and_F": 0.0}}
+
+    main_c = max(contours, key=cv2.contourArea)
+    peri = float(cv2.arcLength(main_c, True))
+
+    if target_num_points is not None:
+        # Binary search on epsilon to hit target_num_points
+        low_eps, high_eps = 0.2, max(2.0, 0.08 * peri)
+        approx = main_c
+        for _ in range(12):
+            mid_eps = 0.5 * (low_eps + high_eps)
+            approx = cv2.approxPolyDP(main_c, mid_eps, True)
+            if len(approx) > target_num_points:
+                low_eps = mid_eps
+            else:
+                high_eps = mid_eps
+        pts = approx[:, 0, :].astype(np.float64)
+    else:
+        eps = max(0.5, epsilon_ratio * peri)
+        approx = cv2.approxPolyDP(main_c, eps, True)
+        pts = approx[:, 0, :].astype(np.float64)
+
+    schema = [
+        {
+            "index": i,
+            "anchor": [float(pts[i, 0]), float(pts[i, 1])],
+            "in_handle": [0.0, 0.0],
+            "out_handle": [0.0, 0.0],
+            "hermite_tangent": [0.0, 0.0],
+            "tension": 0.0,
+            "is_corner": True,
+        }
+        for i in range(len(pts))
+    ]
+    recon = rasterize_bezier_shapes([schema], h, w, samples_per_segment=4)
+    metrics = compute_j_and_f_metrics(recon, mask)
+    return {
+        "num_control_points": len(schema),
+        "control_points": schema,
+        "reconstructed_mask": recon,
+        "metrics": metrics,
+    }
+
+
+def sam2_autotrace_vectorize(
+    mask: np.ndarray,
+    step_px: float = 11.0,
+) -> Dict[str, Any]:
+    """
+    Baseline 2 (Table 1): SAM 2 Auto-Trace (Nuke Auto-Trace / uniform spline tracing baseline).
+    Traces the raw unsmoothed raster contour at uniform arc-length intervals without
+    curvature-adaptive vertex pruning or cusp tension retraction, resulting in dense
+    control points and stair-stepping oscillation at corners.
+    """
+    h, w = mask.shape[:2]
+    # Unsmoothed raw raster contour (smooth_sigma=0.0) as traced directly from binary mask
+    raw_contour = extract_ordered_contour(mask, smooth_sigma=0.0)
+    if len(raw_contour) == 0:
+        return {"num_control_points": 0, "control_points": [], "reconstructed_mask": np.zeros((h, w), dtype=np.uint8), "metrics": {"J": 0.0, "F": 0.0, "J_and_F": 0.0}}
+
+    diffs = np.diff(np.vstack([raw_contour, raw_contour[:1]]), axis=0)
+    seg_lens = np.hypot(diffs[:, 0], diffs[:, 1])
+    peri = float(np.sum(seg_lens))
+    n_pts = max(16, int(round(peri / max(2.0, step_px))))
+
+    idx_sample = np.linspace(0, len(raw_contour), n_pts, endpoint=False).astype(int)
+    pts = raw_contour[idx_sample]
+
+    # Uniform fixed Catmull-Rom tension (no corner cusp detection)
+    fixed_tau = np.full(len(pts), 0.5, dtype=np.float64)
+    schema = contour_to_hermite_bezier(pts, tensions=fixed_tau)
+    recon = rasterize_bezier_shapes([schema], h, w)
+    metrics = compute_j_and_f_metrics(recon, mask)
+    return {
+        "num_control_points": len(schema),
+        "control_points": schema,
+        "reconstructed_mask": recon,
+        "metrics": metrics,
+    }
+
+
+def least_squares_bspline_fit(
+    mask: np.ndarray,
+    num_segments: int = 20,
+    newton_iters: int = 5,
+) -> Dict[str, Any]:
+    """
+    Baseline 3 (Table 1): Iterative Least-Squares Cubic Spline / Bezier Fitting (Schneider 1990).
+    Splits the contour into num_segments spans and iteratively fits cubic Bezier handles
+    via chord-length parameterization and Newton-Raphson parameter refinement.
+    """
+    h, w = mask.shape[:2]
+    contour = extract_ordered_contour(mask, smooth_sigma=1.0)
+    if len(contour) < num_segments * 2:
+        return mask_to_hermite_bezier_shape(mask, target_num_points=num_segments)
+
+    n_c = len(contour)
+    split_indices = np.linspace(0, n_c, num_segments, endpoint=False).astype(int)
+    anchors = contour[split_indices]
+    in_handles = np.zeros((num_segments, 2), dtype=np.float64)
+    out_handles = np.zeros((num_segments, 2), dtype=np.float64)
+
+    for s in range(num_segments):
+        i_start = split_indices[s]
+        i_end = split_indices[(s + 1) % num_segments]
+        if i_end > i_start:
+            seg_pts = contour[i_start : i_end + 1]
+        else:
+            seg_pts = np.vstack([contour[i_start:], contour[: i_end + 1]])
+
+        p0 = seg_pts[0]
+        p3 = seg_pts[-1]
+        if len(seg_pts) <= 3:
+            chord = p3 - p0
+            out_handles[s] = chord / 3.0
+            in_handles[(s + 1) % num_segments] = -chord / 3.0
+            continue
+
+        # Initial chord-length parameterization u in [0, 1]
+        d = np.hypot(np.diff(seg_pts[:, 0]), np.diff(seg_pts[:, 1]))
+        cum = np.concatenate([[0.0], np.cumsum(d)])
+        total_len = cum[-1] + 1e-8
+        u = cum / total_len
+
+        b1 = p0 + (p3 - p0) / 3.0
+        b2 = p0 + 2.0 * (p3 - p0) / 3.0
+
+        # Iterative least-squares + Newton-Raphson reparameterization
+        for _ in range(max(1, newton_iters)):
+            u_col = u.reshape(-1, 1)
+            om = 1.0 - u_col
+            a1 = 3.0 * (om ** 2) * u_col
+            a2 = 3.0 * om * (u_col ** 2)
+            rhs = seg_pts - ((om ** 3) * p0 + (u_col ** 3) * p3)
+
+            A_mat = np.hstack([a1, a2])  # (M, 2)
+            # Solve 2x2 normal equations for [b1, b2]
+            ata = A_mat.T @ A_mat + 1e-6 * np.eye(2)
+            atb = A_mat.T @ rhs
+            sol = np.linalg.solve(ata, atb)
+            b1, b2 = sol[0], sol[1]
+
+            # Newton-Raphson parameter update: u <- u - (Q(u) - P) . Q'(u) / |Q'(u)|^2
+            q_u = ((om ** 3) * p0 + a1 * b1 + a2 * b2 + (u_col ** 3) * p3)
+            qp_u = (
+                3.0 * (om ** 2) * (b1 - p0)
+                + 6.0 * om * u_col * (b2 - b1)
+                + 3.0 * (u_col ** 2) * (p3 - b2)
+            )
+            num = np.sum((q_u - seg_pts) * qp_u, axis=1)
+            den = np.sum(qp_u * qp_u, axis=1) + 1e-8
+            u = np.clip(u - num / den, 0.0, 1.0)
+            u[0], u[-1] = 0.0, 1.0
+
+        out_handles[s] = b1 - p0
+        in_handles[(s + 1) % num_segments] = b2 - p3
+
+    schema = []
+    for i in range(num_segments):
+        schema.append(
+            {
+                "index": i,
+                "anchor": [float(anchors[i, 0]), float(anchors[i, 1])],
+                "in_handle": [float(in_handles[i, 0]), float(in_handles[i, 1])],
+                "out_handle": [float(out_handles[i, 0]), float(out_handles[i, 1])],
+                "hermite_tangent": [float(3.0 * out_handles[i, 0]), float(3.0 * out_handles[i, 1])],
+                "tension": 0.5,
+                "is_corner": False,
+            }
+        )
+
+    recon = rasterize_bezier_shapes([schema], h, w)
+    metrics = compute_j_and_f_metrics(recon, mask)
+    return {
+        "num_control_points": len(schema),
+        "control_points": schema,
+        "reconstructed_mask": recon,
+        "metrics": metrics,
+    }

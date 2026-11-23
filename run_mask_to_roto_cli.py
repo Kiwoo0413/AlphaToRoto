@@ -1,7 +1,7 @@
 """
-CLI & Demo Runner for HumanInTheLoop_Mask (AutoRoto)
+CLI & Demo Runner for AlphaToRoto
 Converts a folder of tracked raster alpha masks (or RGB frames via mask generator) into:
-  1. An artist-editable multi-part parametric cubic Bezier project (`roto_project.json`)
+  1. An artist-editable multi-part parametric cubic Bezier project (`alphatoroto_project.json`)
   2. A standalone Foundry Nuke Python script (`build_nuke_roto.py`) that builds the animated
      multi-part Roto node inside Nuke
   3. Per-frame SVG vector previews with control points and tangent handles (`svg_previews/`)
@@ -15,7 +15,7 @@ import json
 import cv2
 
 from mask_generator import TrackedMaskGenerator
-from autoroto_pipeline import AutoRotoPipeline
+from autoroto_pipeline import AlphaToRotoPipeline
 from test_human_in_the_loop_mask import create_synthetic_articulated_sequence
 
 
@@ -70,7 +70,7 @@ def main():
         print("[Demo Mode] Generating 9-frame articulated object mask & RGB sequence...")
         masks, frames_rgb = create_synthetic_articulated_sequence(num_frames=9)
 
-    pipeline = AutoRotoPipeline(
+    pipeline = AlphaToRotoPipeline(
         overlap_margin_px=args.overlap_px,
         max_parts=args.max_parts,
         min_points_per_part=8,
@@ -80,7 +80,7 @@ def main():
     project = pipeline.build_editable_roto_from_masks(masks, frames_rgb=frames_rgb)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    json_path = os.path.join(args.output_dir, "autoroto_project.json")
+    json_path = os.path.join(args.output_dir, "alphatoroto_project.json")
     nuke_script_path = os.path.join(args.output_dir, "build_nuke_roto.py")
     svg_dir = os.path.join(args.output_dir, "svg_previews")
     os.makedirs(svg_dir, exist_ok=True)

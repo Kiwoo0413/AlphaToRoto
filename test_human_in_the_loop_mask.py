@@ -1,5 +1,5 @@
 """
-Comprehensive Unit & Integration Tests for HumanInTheLoop_Mask (AutoRoto)
+Comprehensive Unit & Integration Tests for AlphaToRoto
 Verifies:
   1. Stage 1: Tracked Raster Alpha Mask Generation & Master Frame Selection (Eq. 1)
   2. Stage 2: Kinematic-Geometric Part Decomposition & 10-15 px Seam Overlap Margin (Eq. 2)
@@ -28,8 +28,12 @@ from hermite_bezier_converter import (
     mask_to_hermite_bezier_shape,
     rasterize_bezier_shapes,
     compute_j_and_f_metrics,
+    compute_contour_rmse_px,
+    rdp_polygon_vectorize,
+    sam2_autotrace_vectorize,
+    least_squares_bspline_fit,
 )
-from autoroto_pipeline import AutoRotoPipeline
+from autoroto_pipeline import AlphaToRotoPipeline, AutoRotoPipeline
 
 
 def create_synthetic_articulated_sequence(
@@ -239,6 +243,43 @@ class TestHumanInTheLoopMaskSystem(unittest.TestCase):
             self.assertTrue(os.path.isfile(json_path))
             self.assertTrue(os.path.isfile(svg_path))
             self.assertTrue(os.path.isfile(nuke_py_path))
+
+            from interactive_roto_viewer import generate_interactive_html_studio
+            html_path = os.path.join(tmpdir, "interactive_autoroto_studio.html")
+            generate_interactive_html_studio(project, html_path)
+            self.assertTrue(os.path.isfile(html_path))
+
+    def test_stage5_baselines_ablations_and_sequence_metrics(self):
+        """
+        Verifies Table 1 baselines (RDP, SAM2 Auto-Trace, Least-Squares B-Spline),
+        Table 2/3 sequence metrics (RMSE, T_flicker, dJ_decay, Gap_percent),
+        and ablation configurations (linear blending, disabled tangent rotation).
+        """
+        m = self.masks[4]
+        rdp_res = rdp_polygon_vectorize(m, epsilon_ratio=0.0025)
+        sam_res = sam2_autotrace_vectorize(m, step_px=12.0)
+        lsq_res = least_squares_bspline_fit(m, num_segments=16, newton_iters=3)
+        our_res = mask_to_hermite_bezier_shape(m, min_points=10, max_points=16)
+
+        self.assertGreater(rdp_res["num_control_points"], 0)
+        self.assertGreater(sam_res["num_control_points"], 0)
+        self.assertEqual(lsq_res["num_control_points"], 16)
+        self.assertGreaterEqual(our_res["metrics"]["J"], 92.0)
+
+        rmse_val = compute_contour_rmse_px([our_res["control_points"]], m)
+        self.assertLess(rmse_val, 5.0)
+
+        pipe_full = AutoRotoPipeline(
+            overlap_margin_px=12,
+            max_parts=2,
+            blending_mode="c1_vis",
+            use_tangent_rotation=True,
+        )
+        proj_full = pipe_full.build_editable_roto_from_masks(self.masks, frames_rgb=self.frames_rgb)
+        metrics_full = pipe_full.evaluate_sequence_metrics(proj_full, self.masks)
+        self.assertIn("T_flicker", metrics_full)
+        self.assertIn("RMSE_px", metrics_full)
+        self.assertEqual(metrics_full["Gap_percent"], 0.0)
 
 
 if __name__ == "__main__":
