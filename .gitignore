@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 web_output/
+Test_mask/
+user_mask_test/
