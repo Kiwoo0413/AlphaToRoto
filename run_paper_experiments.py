@@ -26,8 +26,8 @@ import numpy as np
 import cv2
 
 from mask_generator import TrackedMaskGenerator, select_master_frame
-from part_decomposition import decompose_mask_into_parts
-from hermite_bezier_converter import (
+from roto_geometry import (
+    decompose_mask_into_parts,
     extract_ordered_contour,
     select_curvature_adaptive_anchors,
     contour_to_hermite_bezier,

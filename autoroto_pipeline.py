@@ -12,21 +12,78 @@ Integrates:
 import os
 import json
 import math
+import itertools
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import cv2
 
-from mask_generator import TrackedMaskGenerator, select_master_frame
-from part_decomposition import decompose_mask_into_parts
-from hermite_bezier_converter import (
+from mask_generator import (
+    TrackedMaskGenerator,
+    select_master_frame,
+    compute_object_vector_flow_profile,
+    select_representative_master_frames,
+)
+from roto_geometry import (
+    decompose_mask_into_parts,
     extract_ordered_contour,
     select_curvature_adaptive_anchors,
+    compute_adaptive_tensions,
     contour_to_hermite_bezier,
     rasterize_bezier_shapes,
     compute_j_and_f_metrics,
     compute_contour_rmse_px,
+    compute_signed_area,
+    compute_master_optical_flow,
 )
-from nuke_bridge import blend_bidirectional_trajectories
+
+
+def blend_bidirectional_trajectories(
+    fwd_tracks: Dict[int, Dict[int, Tuple[float, float, float]]],
+    bwd_tracks: Dict[int, Dict[int, Tuple[float, float, float]]],
+    start_k: int,
+    end_k: int,
+) -> Dict[int, Dict[int, Tuple[float, float, float]]]:
+    """
+    Blends forward and backward trajectories between keyframes start_k and end_k
+    using C1 smoothstep s(t)=3t^2-2t^3 and visibility weighting (Eqs. 6-7),
+    with exact ground-truth preservation at f == start_k and f == end_k.
+    """
+    blended: Dict[int, Dict[int, Tuple[float, float, float]]] = {}
+    span = end_k - start_k
+    all_pts = set(fwd_tracks.keys()).intersection(set(bwd_tracks.keys()))
+
+    for pt_idx in all_pts:
+        blended[pt_idx] = {}
+        pt_fwd = fwd_tracks[pt_idx]
+        pt_bwd = bwd_tracks[pt_idx]
+        for f in range(start_k, end_k + 1):
+            if f not in pt_fwd or f not in pt_bwd:
+                continue
+            xf, yf, vf = pt_fwd[f]
+            xb, yb, vb = pt_bwd[f]
+            if span <= 0:
+                blended[pt_idx][f] = (xf, yf, max(vf, vb))
+                continue
+
+            t = max(0.0, min(1.0, float(f - start_k) / float(span)))
+            s = 3.0 * (t ** 2) - 2.0 * (t ** 3)
+            w_a = (1.0 - s) * (max(0.0, float(vf)) + 0.05)
+            w_b = s * (max(0.0, float(vb)) + 0.05)
+            w_sum = w_a + w_b
+            if w_sum < 1e-6:
+                bx, by = 0.5 * (xf + xb), 0.5 * (yf + yb)
+            else:
+                bx = (w_a * xf + w_b * xb) / w_sum
+                by = (w_a * yf + w_b * yb) / w_sum
+
+            if f == start_k:
+                bx, by = xf, yf
+            elif f == end_k:
+                bx, by = xb, yb
+
+            blended[pt_idx][f] = (bx, by, max(float(vf), float(vb)))
+
+    return blended
 
 
 def compute_rotated_tangents(
@@ -398,6 +455,204 @@ def bake_part_frames_with_rotated_tangents(
     return baked_frames
 
 
+def _mask_centroid(mask: np.ndarray) -> np.ndarray:
+    """Computes (x, y) foreground centroid for a binary mask."""
+    ys, xs = np.nonzero(mask > 127)
+    if len(xs) == 0:
+        return np.array([mask.shape[1] / 2.0, mask.shape[0] / 2.0], dtype=np.float64)
+    return np.array([float(np.mean(xs)), float(np.mean(ys))], dtype=np.float64)
+
+
+def build_dynamic_part_masks_sequence(
+    masks: List[np.ndarray],
+    decomp_parts: List[Dict[str, Any]],
+    master_idx: int,
+    master_frames: List[int],
+    frame_numbers: List[int],
+    overlap_margin_px: int = 12,
+) -> Dict[int, List[np.ndarray]]:
+    """
+    Constructs dynamic per-frame part masks across the sequence:
+      1. Shifts each primary master part mask by the foreground centroid displacement on frame t
+         (when displacement exceeds 5 px), dilates by 25x25, and intersects with the frame t
+         foreground mask.
+      2. On secondary representative master frames, re-decomposes the frame mask and matches parts
+         1-to-1 by relative centroid so large articulation/translation keeps exact part boundaries.
+    """
+    num_parts = len(decomp_parts)
+    if num_parts == 0:
+        return {}
+    if num_parts <= 1:
+        pid0 = int(decomp_parts[0]["part_id"])
+        return {pid0: [m.copy() for m in masks]}
+
+    h, w = masks[master_idx].shape[:2]
+    c_master = _mask_centroid(masks[master_idx])
+    dil_kernel = np.ones((25, 25), np.uint8)
+    frame_to_idx = {f: i for i, f in enumerate(frame_numbers)}
+
+    part_masks_all: Dict[int, List[np.ndarray]] = {}
+    prim_masks: List[np.ndarray] = []
+
+    for p in decomp_parts:
+        pid = int(p["part_id"])
+        p_mask_master = p.get("mask") if p.get("mask") is not None else p.get("_part_master_mask")
+        if p_mask_master is None:
+            p_mask_master = masks[master_idx]
+        prim_masks.append(p_mask_master)
+
+        seq_list: List[np.ndarray] = []
+        for t_idx, m in enumerate(masks):
+            if t_idx == master_idx:
+                seq_list.append(p_mask_master.copy())
+            else:
+                dc = _mask_centroid(m) - c_master
+                if float(np.hypot(dc[0], dc[1])) > 5.0:
+                    shift_m = np.float32([[1.0, 0.0, float(dc[0])], [0.0, 1.0, float(dc[1])]])
+                    part_prior = cv2.warpAffine(
+                        p_mask_master, shift_m, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+                    )
+                else:
+                    part_prior = p_mask_master
+                dilated = cv2.dilate(part_prior, dil_kernel)
+                cand = cv2.bitwise_and(m, dilated)
+                seq_list.append(cand if np.count_nonzero(cand) > 50 else m.copy())
+        part_masks_all[pid] = seq_list
+
+    rel_prim = [_mask_centroid(pm) - c_master for pm in prim_masks]
+    master_frame_num = frame_numbers[master_idx]
+
+    for sec_f in master_frames:
+        if sec_f == master_frame_num or sec_f not in frame_to_idx:
+            continue
+        sec_idx = frame_to_idx[sec_f]
+        sec_decomp = decompose_mask_into_parts(
+            masks[sec_idx],
+            max_parts=num_parts,
+            overlap_margin_px=overlap_margin_px,
+        )
+        if len(sec_decomp["parts"]) != num_parts:
+            continue
+
+        c_sec = _mask_centroid(masks[sec_idx])
+        rel_sec = [_mask_centroid(sp["mask"]) - c_sec for sp in sec_decomp["parts"]]
+
+        if num_parts <= 6:
+            best_perm = min(
+                itertools.permutations(range(num_parts)),
+                key=lambda perm: sum(
+                    float(np.linalg.norm(rel_prim[i] - rel_sec[perm[i]]))
+                    for i in range(num_parts)
+                ),
+            )
+        else:
+            used = set()
+            perm_list = []
+            for i in range(num_parts):
+                best_j = min(
+                    (j for j in range(num_parts) if j not in used),
+                    key=lambda j: float(np.linalg.norm(rel_prim[i] - rel_sec[j])),
+                )
+                used.add(best_j)
+                perm_list.append(best_j)
+            best_perm = tuple(perm_list)
+
+        for i, p in enumerate(decomp_parts):
+            pid = int(p["part_id"])
+            part_masks_all[pid][sec_idx] = sec_decomp["parts"][best_perm[i]]["mask"].copy()
+
+    return part_masks_all
+
+
+def synthesize_linked_master_keyframe_cps(
+    primary_cps: List[Dict[str, Any]],
+    primary_part_mask: np.ndarray,
+    sec_part_mask: np.ndarray,
+    default_tension: float = 0.5,
+    cusp_angle_deg: float = 70.0,
+) -> List[Dict[str, Any]]:
+    """
+    Synthesizes topology-locked Bezier control points on a secondary representative master
+    frame via monotonic arc-length-fraction + centroid/scale contour mapping, preserving exact
+    vertex ordering without crossing and landing directly on the secondary part boundary.
+    """
+    num_pts = len(primary_cps)
+    prim_pts = np.array(
+        [[float(cp["anchor"][0]), float(cp["anchor"][1])] for cp in primary_cps],
+        dtype=np.float64,
+    )
+    c_prim = extract_ordered_contour(primary_part_mask, smooth_sigma=1.2)
+    c_sec = extract_ordered_contour(sec_part_mask, smooth_sigma=1.2)
+
+    if len(c_sec) < max(6, num_pts) or num_pts < 3:
+        shift = _mask_centroid(sec_part_mask) - _mask_centroid(primary_part_mask)
+        fallback: List[Dict[str, Any]] = []
+        for i, cp in enumerate(primary_cps):
+            fallback.append(
+                {
+                    "index": i,
+                    "anchor": [float(cp["anchor"][0] + shift[0]), float(cp["anchor"][1] + shift[1])],
+                    "in_handle": list(cp["in_handle"]),
+                    "out_handle": list(cp["out_handle"]),
+                    "is_keyframe": True,
+                    "visibility": 1.0,
+                }
+            )
+        return fallback
+
+    if compute_signed_area(prim_pts) * compute_signed_area(c_sec) < 0.0:
+        c_sec = c_sec[::-1].copy()
+
+    ref_cloud = c_prim if len(c_prim) >= 6 else prim_pts
+    mean_p = np.mean(ref_cloud, axis=0)
+    std_p = np.std(ref_cloud, axis=0) + 1e-6
+    mean_s = np.mean(c_sec, axis=0)
+    std_s = np.std(c_sec, axis=0) + 1e-6
+    scale = np.clip(std_s / std_p, 0.75, 1.35)
+    pred = (prim_pts - mean_p) * scale + mean_s
+
+    closed_prim = np.vstack([prim_pts, prim_pts[0:1]])
+    diffs = np.diff(closed_prim, axis=0)
+    seg_lens = np.hypot(diffs[:, 0], diffs[:, 1])
+    total_perim = float(np.sum(seg_lens)) + 1e-8
+    cum_lens = np.concatenate([[0.0], np.cumsum(seg_lens[:-1])])
+    p_fracs = cum_lens / total_perim
+
+    d0 = np.hypot(c_sec[:, 0] - pred[0, 0], c_sec[:, 1] - pred[0, 1])
+    start_idx = int(np.argmin(d0))
+    c_rolled = np.roll(c_sec, -start_idx, axis=0)
+    n_c = len(c_rolled)
+
+    chosen_indices = [0]
+    search_half = max(3, int(round(0.08 * n_c)))
+    for i in range(1, num_pts):
+        target_idx = int(round(float(p_fracs[i]) * n_c))
+        lo = max(chosen_indices[-1] + 1, target_idx - search_half)
+        hi = min(n_c - (num_pts - i), target_idx + search_half)
+        if lo > hi:
+            best_idx = max(chosen_indices[-1] + 1, min(n_c - (num_pts - i), lo))
+        else:
+            window = c_rolled[lo : hi + 1]
+            dists = np.hypot(window[:, 0] - pred[i, 0], window[:, 1] - pred[i, 1])
+            best_idx = lo + int(np.argmin(dists))
+        chosen_indices.append(best_idx)
+
+    sec_anchors = c_rolled[chosen_indices]
+    tensions, _ = compute_adaptive_tensions(
+        sec_anchors, default_tension=default_tension, cusp_angle_deg=cusp_angle_deg
+    )
+    sec_cps = contour_to_hermite_bezier(
+        sec_anchors,
+        tensions=tensions,
+        default_tension=default_tension,
+        cusp_angle_deg=cusp_angle_deg,
+    )
+    for cp in sec_cps:
+        cp["is_keyframe"] = True
+        cp["visibility"] = 1.0
+    return sec_cps
+
+
 class AlphaToRotoPipeline:
     """
     End-to-End AlphaToRoto Human-in-the-Loop Conversion System transforming tracked raster alpha masks
@@ -414,6 +669,9 @@ class AlphaToRotoPipeline:
         blending_mode: str = "c1_vis",
         use_tangent_rotation: bool = True,
         use_contour_snapping: bool = True,
+        auto_multi_master: bool = False,
+        flow_motion_threshold_px: float = 22.0,
+        max_master_frames: int = 4,
     ):
         self.overlap_margin_px = overlap_margin_px
         self.max_parts = max_parts
@@ -423,6 +681,356 @@ class AlphaToRotoPipeline:
         self.blending_mode = blending_mode
         self.use_tangent_rotation = use_tangent_rotation
         self.use_contour_snapping = use_contour_snapping
+        self.auto_multi_master = auto_multi_master
+        self.flow_motion_threshold_px = flow_motion_threshold_px
+        self.max_master_frames = max_master_frames
+
+    @staticmethod
+    def select_stage1_masters(
+        masks: List[np.ndarray],
+        frames_rgb: Optional[List[np.ndarray]] = None,
+        frame_numbers: Optional[List[int]] = None,
+        auto_multi_master: bool = False,
+        flow_motion_threshold_px: float = 22.0,
+        max_master_frames: int = 4,
+        master_frames_override: Optional[List[int]] = None,
+        include_flow_profile: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Stage 1 master selection (Eq. 1) with optional vector-flow multi-master promotion
+        and explicit master_frames_override handling.
+        """
+        if not masks:
+            raise ValueError("masks list cannot be empty.")
+        num_frames = len(masks)
+        if frame_numbers is None:
+            frame_numbers = list(range(1, num_frames + 1))
+
+        use_multi = bool(auto_multi_master) or bool(master_frames_override and len(master_frames_override) >= 2)
+        if use_multi:
+            master_info = select_representative_master_frames(
+                masks,
+                frames=frames_rgb,
+                frame_numbers=frame_numbers,
+                flow_motion_threshold_px=flow_motion_threshold_px,
+                max_master_frames=max_master_frames,
+            )
+            if master_frames_override:
+                f_to_idx = {f: i for i, f in enumerate(frame_numbers)}
+                chosen = sorted({int(f) for f in master_frames_override if int(f) in f_to_idx})
+                if chosen:
+                    primary_f = max(
+                        chosen,
+                        key=lambda f: master_info["per_frame_metrics"][f_to_idx[f]]["score"],
+                    )
+                    master_info["master_frame"] = int(primary_f)
+                    master_info["master_index"] = int(f_to_idx[primary_f])
+                    master_info["master_frames"] = chosen
+                    master_info["master_indices"] = [f_to_idx[f] for f in chosen]
+                    chosen_set = set(chosen)
+                    for idx_m, entry in enumerate(master_info["per_frame_metrics"]):
+                        entry["is_master"] = frame_numbers[idx_m] in chosen_set
+            return master_info
+
+        master_info = select_master_frame(masks, frames=frames_rgb, frame_numbers=frame_numbers)
+        if master_frames_override:
+            f_to_idx = {f: i for i, f in enumerate(frame_numbers)}
+            valid = [int(f) for f in master_frames_override if int(f) in f_to_idx]
+            if valid:
+                master_info["master_frame"] = valid[0]
+                master_info["master_index"] = f_to_idx[valid[0]]
+
+        master_info["master_indices"] = [int(master_info["master_index"])]
+        master_info["master_frames"] = [int(master_info["master_frame"])]
+        if include_flow_profile:
+            flow_prof = compute_object_vector_flow_profile(
+                masks, frames=frames_rgb, frame_numbers=frame_numbers
+            )
+            master_info["large_motion_detected"] = bool(
+                flow_prof["total_motion_px"] >= float(flow_motion_threshold_px)
+            )
+            master_info["flow_profile"] = flow_prof
+            for idx_m, entry in enumerate(master_info["per_frame_metrics"]):
+                entry["flow_mag_px"] = flow_prof["per_frame_flow_mag"][idx_m]
+                entry["p90_flow_mag_px"] = flow_prof["per_frame_p90_mag"][idx_m]
+                entry["cumulative_flow_px"] = flow_prof["cumulative_flow"][idx_m]
+                entry["is_master"] = idx_m == int(master_info["master_index"])
+        else:
+            master_info["large_motion_detected"] = False
+            master_info["flow_profile"] = None
+            for idx_m, entry in enumerate(master_info["per_frame_metrics"]):
+                entry["is_master"] = idx_m == int(master_info["master_index"])
+        return master_info
+
+    @staticmethod
+    def run_stage2_decompose(
+        masks: List[np.ndarray],
+        master_idx: int,
+        frames_rgb: Optional[List[np.ndarray]] = None,
+        max_parts: int = 3,
+        overlap_margin_px: int = 12,
+        defect_depth_thresh_px: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Stage 2: Kinematic-geometric part decomposition & seam overlap margin (Eq. 2)."""
+        master_flow = compute_master_optical_flow(frames_rgb, master_idx)
+        decomp = decompose_mask_into_parts(
+            masks[master_idx],
+            flow=master_flow,
+            max_parts=max(1, int(max_parts)),
+            overlap_margin_px=max(0, int(overlap_margin_px)),
+            defect_depth_thresh_px=float(defect_depth_thresh_px),
+        )
+        for p in decomp["parts"]:
+            if "core_mask" not in p:
+                p["core_mask"] = p["mask"].copy()
+            p.setdefault("enabled", True)
+            p.setdefault("overlap_margin_px", int(decomp["overlap_margin_px"]))
+            p.setdefault("boundary_offset_px", 0)
+            p.setdefault("max_points", None)
+        return decomp
+
+    @staticmethod
+    def run_stage3_fit_parts(
+        decomp: Dict[str, Any],
+        masks: List[np.ndarray],
+        master_info: Dict[str, Any],
+        frame_numbers: List[int],
+        frames_rgb: Optional[List[np.ndarray]] = None,
+        min_points: int = 8,
+        max_points: int = 16,
+        target_points_per_part: Optional[int] = None,
+        default_tension: float = 0.5,
+        cusp_angle_deg: float = 60.0,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Stage 3: O(N) closed-form Hermite-to-Bezier fitting for all enabled parts (Eqs. 3-5)."""
+        enabled_parts = [p for p in decomp["parts"] if p.get("enabled", True)]
+        if not enabled_parts:
+            raise ValueError("Enable at least one decomposed part in Stage 2.")
+
+        master_idx = int(master_info["master_index"])
+        master_frame = int(master_info["master_frame"])
+        master_mask = masks[master_idx]
+        h, w = master_mask.shape[:2]
+
+        parts_roto: List[Dict[str, Any]] = []
+        schemas_master: List[List[Dict[str, Any]]] = []
+
+        for part in enabled_parts:
+            p_mask = part["mask"]
+            part_max_pts = (
+                target_points_per_part
+                if target_points_per_part is not None
+                else int(part.get("max_points") or max_points)
+            )
+            contour = extract_ordered_contour(p_mask, smooth_sigma=1.2)
+            anchors = select_curvature_adaptive_anchors(
+                contour,
+                target_num_points=target_points_per_part,
+                min_points=int(min_points),
+                max_points=part_max_pts,
+            )
+            tensions, _ = compute_adaptive_tensions(
+                anchors,
+                default_tension=float(default_tension),
+                cusp_angle_deg=float(cusp_angle_deg),
+            )
+            cps = contour_to_hermite_bezier(
+                anchors,
+                tensions=tensions,
+                default_tension=float(default_tension),
+                cusp_angle_deg=float(cusp_angle_deg),
+            )
+            schemas_master.append(cps)
+
+            frames_map = {
+                fn: [
+                    {
+                        "index": cp["index"],
+                        "anchor": list(cp["anchor"]),
+                        "in_handle": list(cp["in_handle"]),
+                        "out_handle": list(cp["out_handle"]),
+                        "hermite_tangent": list(cp.get("hermite_tangent", [0.0, 0.0])),
+                        "tension": float(cp.get("tension", default_tension)),
+                        "is_corner": bool(cp.get("is_corner", False)),
+                    }
+                    for cp in cps
+                ]
+                for fn in frame_numbers
+            }
+            parts_roto.append(
+                {
+                    "part_id": part["part_id"],
+                    "name": part["name"],
+                    "num_control_points": len(cps),
+                    "reference_keyframes": {master_frame: cps},
+                    "tracks_per_ref": {},
+                    "frames": frames_map,
+                    "_part_master_mask": p_mask,
+                }
+            )
+
+        recon = rasterize_bezier_shapes(schemas_master, h, w)
+        jf = compute_j_and_f_metrics(recon, master_mask)
+        rmse = compute_contour_rmse_px(schemas_master, master_mask)
+
+        roto_project = {
+            "width": int(w),
+            "height": int(h),
+            "frame_numbers": list(frame_numbers),
+            "master_frame": master_frame,
+            "master_index": master_idx,
+            "master_frames": list(master_info.get("master_frames", [master_frame])),
+            "flow_profile": master_info.get("flow_profile"),
+            "master_selection": master_info,
+            "overlap_margin_px": int(decomp["overlap_margin_px"]),
+            "seam_gap_ratio_master": float(decomp["seam_gap_ratio"]),
+            "cut_lines": decomp["cut_lines"],
+            "parts": parts_roto,
+            "_masks_ref": masks,
+            "_frames_rgb_ref": frames_rgb,
+        }
+        metrics = {
+            "total_points": sum(p["num_control_points"] for p in parts_roto),
+            "points_per_part": [p["num_control_points"] for p in parts_roto],
+            "J": round(jf["J"], 2),
+            "F": round(jf["F"], 2),
+            "J_and_F": round(jf["J_and_F"], 2),
+            "RMSE_px": round(rmse, 2),
+        }
+        return roto_project, metrics
+
+    def run_stage4_propagate(
+        self,
+        roto_project: Dict[str, Any],
+        masks: List[np.ndarray],
+        frames_rgb: Optional[List[np.ndarray]] = None,
+        master_frames: Optional[List[int]] = None,
+        blending_mode: Optional[str] = None,
+        use_tangent_rotation: Optional[bool] = None,
+        use_contour_snapping: Optional[bool] = None,
+        default_tension: Optional[float] = None,
+        cusp_angle_deg: float = 70.0,
+    ) -> Dict[str, Any]:
+        """Stage 4: Multi-master linked fixed-topology propagation & C1 baking (Eqs. 6-8)."""
+        frame_numbers = roto_project["frame_numbers"]
+        master_frame = int(roto_project["master_frame"])
+        master_idx = int(roto_project["master_index"])
+        frame_set = set(frame_numbers)
+        linked_masters = sorted(
+            {
+                int(f)
+                for f in (master_frames if master_frames is not None else roto_project.get("master_frames", [master_frame]))
+                if int(f) in frame_set
+            }
+            | {master_frame}
+        )
+
+        b_mode = self.blending_mode if blending_mode is None else blending_mode
+        rot_tan = self.use_tangent_rotation if use_tangent_rotation is None else bool(use_tangent_rotation)
+        snap = self.use_contour_snapping if use_contour_snapping is None else bool(use_contour_snapping)
+        tension = self.default_tension if default_tension is None else float(default_tension)
+
+        part_masks_all = build_dynamic_part_masks_sequence(
+            masks,
+            roto_project["parts"],
+            master_idx,
+            linked_masters,
+            frame_numbers,
+            overlap_margin_px=int(roto_project.get("overlap_margin_px", self.overlap_margin_px)),
+        )
+        frame_to_idx = {f: i for i, f in enumerate(frame_numbers)}
+
+        for part in roto_project["parts"]:
+            pid = int(part["part_id"])
+            master_cps = part["reference_keyframes"][master_frame]
+            p_mask_master = part.get("_part_master_mask")
+            if p_mask_master is None:
+                p_mask_master = masks[master_idx]
+            part_masks_seq = part_masks_all.get(pid, masks)
+            part["_part_masks_seq"] = part_masks_seq
+
+            raw_tracks = propagate_points_from_reference(
+                master_cps,
+                ref_frame=master_frame,
+                frame_numbers=frame_numbers,
+                masks=part_masks_seq,
+                frames_rgb=frames_rgb,
+                use_contour_snapping=snap,
+            )
+            ref_keyframes_map = {master_frame: master_cps}
+            tracks_per_ref = {master_frame: raw_tracks}
+
+            for sec_f in linked_masters:
+                if sec_f == master_frame:
+                    continue
+                sec_cps = synthesize_linked_master_keyframe_cps(
+                    primary_cps=master_cps,
+                    primary_part_mask=p_mask_master,
+                    sec_part_mask=part_masks_seq[frame_to_idx[sec_f]],
+                    default_tension=tension,
+                    cusp_angle_deg=cusp_angle_deg,
+                )
+                ref_keyframes_map[sec_f] = sec_cps
+                tracks_per_ref[sec_f] = propagate_points_from_reference(
+                    sec_cps,
+                    ref_frame=sec_f,
+                    frame_numbers=frame_numbers,
+                    masks=part_masks_seq,
+                    frames_rgb=frames_rgb,
+                    use_contour_snapping=snap,
+                )
+
+            sorted_refs = sorted(ref_keyframes_map.keys())
+            blended_tracks = blend_multi_ref_tracks(
+                tracks_per_ref,
+                ref_frames=sorted_refs,
+                start_f=frame_numbers[0],
+                end_f=frame_numbers[-1],
+                blending_mode=b_mode,
+            )
+            part["reference_keyframes"] = ref_keyframes_map
+            part["tracks_per_ref"] = tracks_per_ref
+            part["frames"] = bake_part_frames_with_rotated_tangents(
+                ref_keyframes_map,
+                blended_tracks,
+                frame_numbers,
+                use_tangent_rotation=rot_tan,
+            )
+
+        roto_project["master_frames"] = linked_masters
+        roto_project["_masks_ref"] = masks
+        roto_project["_frames_rgb_ref"] = frames_rgb
+        return roto_project
+
+    @staticmethod
+    def serialize_project(
+        roto_project: Optional[Dict[str, Any]],
+        include_tracks: bool = False,
+        stringify_frame_keys: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Converts an internal roto_project dict into a JSON-serializable payload."""
+        if roto_project is None:
+            return None
+        out: Dict[str, Any] = {}
+        for k, v in roto_project.items():
+            if k.startswith("_"):
+                continue
+            if k == "parts":
+                out_parts = []
+                for p in v:
+                    pd: Dict[str, Any] = {}
+                    for pk, pv in p.items():
+                        if pk.startswith("_") or (not include_tracks and pk == "tracks_per_ref"):
+                            continue
+                        if stringify_frame_keys and pk in ("reference_keyframes", "frames") and isinstance(pv, dict):
+                            pd[pk] = {str(fk): fv for fk, fv in pv.items()}
+                        else:
+                            pd[pk] = pv
+                    out_parts.append(pd)
+                out["parts"] = out_parts
+            else:
+                out[k] = v
+        return out
 
     def build_editable_roto_from_masks(
         self,
@@ -430,124 +1038,58 @@ class AlphaToRotoPipeline:
         frames_rgb: Optional[List[np.ndarray]] = None,
         frame_numbers: Optional[List[int]] = None,
         target_points_per_part: Optional[int] = None,
+        master_frames_override: Optional[List[int]] = None,
+        auto_multi_master: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Executes Stages 1 -> 2 -> 3 -> 4 on an input sequence of tracked raster alpha masks.
-        Returns a complete editable Roto project dictionary that supports non-destructive
-        artist keyframe edits, Nuke Roto node injection, JSON serialization, and SVG export.
+        Returns a complete editable Roto project dictionary supporting non-destructive artist
+        keyframe edits, multi-master linking, Nuke Roto node injection, JSON, and SVG export.
         """
         if not masks:
             raise ValueError("masks list cannot be empty.")
 
         num_frames = len(masks)
-        h, w = masks[0].shape[:2]
         if frame_numbers is None:
             frame_numbers = list(range(1, num_frames + 1))
 
-        # Stage 1: Master Frame Selection (Eq. 1)
-        master_info = select_master_frame(masks, frames=frames_rgb, frame_numbers=frame_numbers)
-        master_idx = master_info["master_index"]
-        master_frame = master_info["master_frame"]
-        master_mask = masks[master_idx]
-
-        # Compute optical flow at master frame if RGB frames are available
-        master_flow = None
-        if frames_rgb is not None and len(frames_rgb) > 1:
-            next_idx = min(num_frames - 1, master_idx + 1) if master_idx < num_frames - 1 else max(0, master_idx - 1)
-            if next_idx != master_idx:
-                g0 = cv2.cvtColor(frames_rgb[master_idx], cv2.COLOR_RGB2GRAY) if frames_rgb[master_idx].ndim == 3 else frames_rgb[master_idx]
-                g1 = cv2.cvtColor(frames_rgb[next_idx], cv2.COLOR_RGB2GRAY) if frames_rgb[next_idx].ndim == 3 else frames_rgb[next_idx]
-                master_flow = cv2.calcOpticalFlowFarneback(g0, g1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-
-        # Stage 2: Kinematic-Geometric Part Decomposition & 10-15 px Seam Overlap Margin (Eq. 2)
-        decomp = decompose_mask_into_parts(
-            master_mask,
-            flow=master_flow,
+        use_multi = (
+            self.auto_multi_master if auto_multi_master is None else bool(auto_multi_master)
+        )
+        master_info = self.select_stage1_masters(
+            masks,
+            frames_rgb=frames_rgb,
+            frame_numbers=frame_numbers,
+            auto_multi_master=use_multi,
+            flow_motion_threshold_px=self.flow_motion_threshold_px,
+            max_master_frames=self.max_master_frames,
+            master_frames_override=master_frames_override,
+            include_flow_profile=False,
+        )
+        decomp = self.run_stage2_decompose(
+            masks,
+            master_idx=int(master_info["master_index"]),
+            frames_rgb=frames_rgb,
             max_parts=self.max_parts,
             overlap_margin_px=self.overlap_margin_px,
         )
-
-        # Stage 3 & 4: Per-Part Hermite-Bezier Fitting (Eqs. 3-5) & Fixed-Topology Propagation (Eqs. 6-8)
-        parts_roto: List[Dict[str, Any]] = []
-
-        for part in decomp["parts"]:
-            p_id = part["part_id"]
-            p_name = part["name"]
-            p_mask_master = part["mask"]
-
-            contour = extract_ordered_contour(p_mask_master, smooth_sigma=1.2)
-            anchors = select_curvature_adaptive_anchors(
-                contour,
-                target_num_points=target_points_per_part,
-                min_points=self.min_points_per_part,
-                max_points=self.max_points_per_part,
-            )
-            master_bezier_cps = contour_to_hermite_bezier(
-                anchors, default_tension=self.default_tension
-            )
-
-            # Build per-frame target masks for this part by intersecting or tracking
-            ref_keyframes_map = {master_frame: master_bezier_cps}
-            part_masks_seq = (
-                masks
-                if len(decomp["parts"]) == 1
-                else [
-                    cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
-                    if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30
-                    else m
-                    for m in masks
-                ]
-            )
-            raw_tracks_from_master = propagate_points_from_reference(
-                master_bezier_cps,
-                ref_frame=master_frame,
-                frame_numbers=frame_numbers,
-                masks=part_masks_seq,
-                frames_rgb=frames_rgb,
-                use_contour_snapping=self.use_contour_snapping,
-            )
-
-            tracks_per_ref = {master_frame: raw_tracks_from_master}
-            blended_tracks = blend_multi_ref_tracks(
-                tracks_per_ref,
-                ref_frames=[master_frame],
-                start_f=frame_numbers[0],
-                end_f=frame_numbers[-1],
-                blending_mode=self.blending_mode,
-            )
-            baked_frames = bake_part_frames_with_rotated_tangents(
-                ref_keyframes_map,
-                blended_tracks,
-                frame_numbers,
-                use_tangent_rotation=self.use_tangent_rotation,
-            )
-
-            parts_roto.append(
-                {
-                    "part_id": p_id,
-                    "name": p_name,
-                    "num_control_points": len(master_bezier_cps),
-                    "reference_keyframes": ref_keyframes_map,
-                    "tracks_per_ref": tracks_per_ref,
-                    "frames": baked_frames,
-                    "_part_master_mask": p_mask_master,
-                }
-            )
-
-        return {
-            "width": w,
-            "height": h,
-            "frame_numbers": frame_numbers,
-            "master_frame": master_frame,
-            "master_index": master_idx,
-            "master_selection": master_info,
-            "overlap_margin_px": self.overlap_margin_px,
-            "seam_gap_ratio_master": decomp["seam_gap_ratio"],
-            "cut_lines": decomp["cut_lines"],
-            "parts": parts_roto,
-            "_masks_ref": masks,
-            "_frames_rgb_ref": frames_rgb,
-        }
+        roto_project, _ = self.run_stage3_fit_parts(
+            decomp,
+            masks=masks,
+            master_info=master_info,
+            frame_numbers=frame_numbers,
+            frames_rgb=frames_rgb,
+            min_points=self.min_points_per_part,
+            max_points=self.max_points_per_part,
+            target_points_per_part=target_points_per_part,
+            default_tension=self.default_tension,
+        )
+        return self.run_stage4_propagate(
+            roto_project,
+            masks=masks,
+            frames_rgb=frames_rgb,
+            master_frames=master_info["master_frames"],
+        )
 
     def apply_artist_keyframe_edit(
         self,
@@ -593,16 +1135,18 @@ class AlphaToRotoPipeline:
 
         if masks is not None and len(part["reference_keyframes"]) == 1:
             p_mask_master = part.get("_part_master_mask")
-            part_masks_seq = (
-                masks
-                if (len(roto_project["parts"]) == 1 or p_mask_master is None)
-                else [
-                    cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
-                    if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30
-                    else m
-                    for m in masks
-                ]
-            )
+            part_masks_seq = part.get("_part_masks_seq")
+            if part_masks_seq is None:
+                part_masks_seq = (
+                    masks
+                    if (len(roto_project["parts"]) == 1 or p_mask_master is None)
+                    else [
+                        cv2.bitwise_and(m, cv2.dilate(p_mask_master, np.ones((25, 25), np.uint8)))
+                        if np.count_nonzero(cv2.bitwise_and(m, p_mask_master)) > 30
+                        else m
+                        for m in masks
+                    ]
+                )
             new_ref_tracks = propagate_points_from_reference(
                 part["reference_keyframes"][edited_frame],
                 ref_frame=edited_frame,
@@ -706,16 +1250,27 @@ class AlphaToRotoPipeline:
         for cut in roto_project["cut_lines"]:
             cv2.line(cut_band, tuple(cut["p1"]), tuple(cut["p2"]), 255, thickness=12)
 
+        master_idx = int(roto_project.get("master_index", 0))
+        c_master = _mask_centroid(gt_masks[master_idx])
+
         for idx, f_num in enumerate(frame_numbers):
             gt_m = (gt_masks[idx] > 127).astype(np.uint8) * 255
             total_fg = int(np.count_nonzero(gt_m))
             if total_fg == 0:
                 continue
+            dc = _mask_centroid(gt_m) - c_master
+            if abs(dc[0]) > 0.5 or abs(dc[1]) > 0.5:
+                shift_cut = np.float32([[1.0, 0.0, float(dc[0])], [0.0, 1.0, float(dc[1])]])
+                frame_cut_band = cv2.warpAffine(
+                    cut_band, shift_cut, (w, h), flags=cv2.INTER_NEAREST, borderValue=0
+                )
+            else:
+                frame_cut_band = cut_band
             # Erode outer boundary by 5 px so only internal seam gaps (not outer contour curvature) are measured
             interior_fg = cv2.erode(gt_m, np.ones((9, 9), np.uint8))
             schemas = [p["frames"][f_num] for p in roto_project["parts"]]
             pred_union = rasterize_bezier_shapes(schemas, h, w)
-            seam_zone_fg = (interior_fg > 0) & (cut_band > 0)
+            seam_zone_fg = (interior_fg > 0) & (frame_cut_band > 0)
             missing_in_seam = np.count_nonzero(seam_zone_fg & (pred_union == 0))
             gap_ratios.append(float(missing_in_seam) / float(total_fg))
 
@@ -909,17 +1464,9 @@ class AlphaToRotoPipeline:
     @staticmethod
     def export_to_json(roto_project: Dict[str, Any], output_json_path: str):
         """Exports the parametric cubic Bezier Roto project to a clean JSON file."""
-        serializable = {}
-        for k, v in roto_project.items():
-            if k.startswith("_"):
-                continue
-            if k == "parts":
-                serializable["parts"] = [
-                    {pk: pv for pk, pv in p.items() if not pk.startswith("_")}
-                    for p in v
-                ]
-            else:
-                serializable[k] = v
+        serializable = AlphaToRotoPipeline.serialize_project(
+            roto_project, include_tracks=True, stringify_frame_keys=False
+        )
         os.makedirs(os.path.dirname(os.path.abspath(output_json_path)), exist_ok=True)
         with open(output_json_path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2, ensure_ascii=False)
@@ -1046,27 +1593,23 @@ class AlphaToRotoPipeline:
         roto_project: Dict[str, Any],
         output_py_path: str,
         key_step: int = 1,
+        attach_autoroto_tab: bool = True,
     ):
         """
         Generates a standalone Python script that can be executed inside Foundry Nuke's
         Script Editor (or `nuke -t`) to construct the animated multi-part cubic Bezier Roto
-        node with all keyframes and tangent handles.
+        node with all keyframes, tangent handles, and (when available) the AlphaToRoto Tab 1 UI.
         """
+        repo_dir = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
         serializable = {
             "width": roto_project["width"],
             "height": roto_project["height"],
             "frame_numbers": roto_project["frame_numbers"],
             "master_frame": roto_project["master_frame"],
-            "parts": [
-                {
-                    "part_id": p["part_id"],
-                    "name": p["name"],
-                    "num_control_points": p["num_control_points"],
-                    "reference_keyframes": {str(k): v for k, v in p["reference_keyframes"].items()},
-                    "frames": {str(k): v for k, v in p["frames"].items()},
-                }
-                for p in roto_project["parts"]
-            ],
+            "overlap_margin_px": int(roto_project.get("overlap_margin_px", 12)),
+            "parts": AlphaToRotoPipeline.serialize_project(
+                roto_project, include_tracks=False, stringify_frame_keys=True
+            )["parts"],
         }
         payload_json = json.dumps(serializable)
 
@@ -1074,25 +1617,39 @@ class AlphaToRotoPipeline:
 Auto-generated Foundry Nuke Roto Node Builder Script (AlphaToRoto)
 Run inside Nuke Script Editor to instantiate the artist-editable multi-part Bezier Roto node.
 """
+import os
+import sys
 import json
 import nuke
 import nuke.rotopaint as rp
 
+REPO_DIR = {repr(repo_dir)}
+ATTACH_AUTOROTO_TAB = {bool(attach_autoroto_tab)}
 ROTO_DATA = json.loads({repr(payload_json)})
 
-def build_alphatoroto_node(key_step={int(key_step)}):
+def build_alphatoroto_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_TAB):
     roto_node = nuke.createNode("Roto", inpanel=False)
     roto_node.setName("AlphaToRoto_EditableParts")
     curves_knob = roto_node["curves"]
     root_layer = getattr(curves_knob, "rootLayer", getattr(curves_knob, "root", None))
+    w = int(ROTO_DATA["width"])
     h = float(ROTO_DATA["height"])
     frame_numbers = ROTO_DATA["frame_numbers"]
 
+    try:
+        fmt_name = f"AlphaToRoto_{{w}}x{{int(h)}}"
+        nuke.addFormat(f"{{w}} {{int(h)}} 1 {{fmt_name}}")
+        roto_node["format"].setValue(fmt_name)
+    except Exception:
+        pass
+
+    all_ref_frames = set()
     for part in ROTO_DATA["parts"]:
         shape = rp.Shape(curves_knob)
         shape.name = part["name"]
         num_pts = int(part["num_control_points"])
         ref_set = set(int(k) for k in part["reference_keyframes"].keys())
+        all_ref_frames.update(ref_set)
 
         for _ in range(num_pts):
             shape.append(rp.ShapeControlPoint())
@@ -1119,6 +1676,33 @@ def build_alphatoroto_node(key_step={int(key_step)}):
         root_layer.append(shape)
 
     curves_knob.changed()
+
+    if attach_tab:
+        try:
+            if os.path.isdir(REPO_DIR) and REPO_DIR not in sys.path:
+                sys.path.insert(0, REPO_DIR)
+            import nuke_bridge
+            nuke_bridge.setup_autoroto_knobs(roto_node)
+            sorted_refs = sorted(all_ref_frames) if all_ref_frames else [int(ROTO_DATA.get("master_frame", frame_numbers[0]))]
+            if roto_node.knob("ar_ref_frame"):
+                roto_node["ar_ref_frame"].setValue(", ".join(str(k) for k in sorted_refs))
+            if roto_node.knob("ar_start_frame"):
+                roto_node["ar_start_frame"].setValue(int(frame_numbers[0]))
+            if roto_node.knob("ar_end_frame"):
+                roto_node["ar_end_frame"].setValue(int(frame_numbers[-1]))
+            if roto_node.knob("ar_overlap_px"):
+                roto_node["ar_overlap_px"].setValue(int(ROTO_DATA.get("overlap_margin_px", 12)))
+            if roto_node.knob("ar_max_parts"):
+                roto_node["ar_max_parts"].setValue(max(1, len(ROTO_DATA["parts"])))
+            if roto_node.knob("ar_status"):
+                roto_node["ar_status"].setValue(
+                    f"Loaded {{len(ROTO_DATA['parts'])}} AlphaToRoto part(s) (Master F{{ROTO_DATA.get('master_frame', 1)}})."
+                )
+            nuke_bridge.hide_intermediate_native_tabs(roto_node)
+            nuke_bridge.make_autoroto_first_tab(roto_node.name(), focus=True)
+        except Exception:
+            pass
+
     return roto_node
 
 build_autoroto_node = build_alphatoroto_node
