@@ -6,6 +6,8 @@ Nuke 내장 Python(NumPy/OpenCV 미설치 환경)과의 충돌을 피하기 위�
 
 ![EditableAlpha Mask-to-Roto Preview](assets/editablealpha_preview.png)
 
+![Real Mask Part Split & Cubic Bezier Roto Preview](assets/real_mask_test_preview.png)
+
 ---
 
 ## 1. Nuke 설치 방법 (1줄 등록)
