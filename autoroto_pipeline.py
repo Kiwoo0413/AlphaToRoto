@@ -10,6 +10,7 @@ Integrates:
 """
 
 import os
+import re
 import json
 import math
 import itertools
@@ -367,6 +368,8 @@ def bake_part_frames_with_rotated_tangents(
     """
     Applies Chord-Aligned Relative Tangent Rotation (Equation 8) across all frames while
     strictly preserving 100% of artist-edited reference keyframes in ref_keyframes_map.
+    When a frame lies between two reference keyframes, rotated tangent handles from both
+    neighbors are blended with C1 smoothstep so manual handle edits transition smoothly.
     When use_tangent_rotation=False (ablation study), tangent handles remain fixed to
     the reference keyframe's initial handle offsets without chord rotation.
 
@@ -376,6 +379,32 @@ def bake_part_frames_with_rotated_tangents(
     sorted_refs = sorted(ref_keyframes_map.keys())
     first_ref = sorted_refs[0]
     num_pts = len(ref_keyframes_map[first_ref])
+
+    def _rotated_handles_from_ref(
+        ref_cps: List[Dict[str, Any]],
+        curr_local_coords: List[Tuple[float, float]],
+    ) -> List[Dict[str, Tuple[float, float]]]:
+        ref_pts_for_bridge = [
+            {
+                "index": i,
+                "local_x": float(ref_cps[i]["anchor"][0]),
+                "local_y": float(ref_cps[i]["anchor"][1]),
+                "lt_rel": (float(ref_cps[i]["in_handle"][0]), float(ref_cps[i]["in_handle"][1])),
+                "rt_rel": (float(ref_cps[i]["out_handle"][0]), float(ref_cps[i]["out_handle"][1])),
+                "fc_rel": (0.0, 0.0),
+            }
+            for i in range(num_pts)
+        ]
+        if use_tangent_rotation:
+            return compute_rotated_tangents(ref_pts_for_bridge, curr_local_coords)
+        return [
+            {
+                "lt_rel": ref_pts_for_bridge[i]["lt_rel"],
+                "rt_rel": ref_pts_for_bridge[i]["rt_rel"],
+                "fc_rel": ref_pts_for_bridge[i]["fc_rel"],
+            }
+            for i in range(num_pts)
+        ]
 
     baked_frames: Dict[int, List[Dict[str, Any]]] = {}
 
@@ -395,44 +424,42 @@ def bake_part_frames_with_rotated_tangents(
             ]
             continue
 
-        # Find nearest preceding reference keyframe for relative tangent rotation base
+        # Find nearest preceding and succeeding reference keyframes
         base_ref = sorted_refs[0]
+        next_ref: Optional[int] = None
         for rk in sorted_refs:
             if rk <= f:
                 base_ref = rk
             else:
+                next_ref = rk
                 break
-
-        base_cps = ref_keyframes_map[base_ref]
-        ref_pts_for_bridge = [
-            {
-                "index": i,
-                "local_x": float(base_cps[i]["anchor"][0]),
-                "local_y": float(base_cps[i]["anchor"][1]),
-                "lt_rel": (float(base_cps[i]["in_handle"][0]), float(base_cps[i]["in_handle"][1])),
-                "rt_rel": (float(base_cps[i]["out_handle"][0]), float(base_cps[i]["out_handle"][1])),
-                "fc_rel": (0.0, 0.0),
-            }
-            for i in range(num_pts)
-        ]
 
         curr_local_coords = [
             (float(blended_tracks[i][f][0]), float(blended_tracks[i][f][1]))
             for i in range(num_pts)
         ]
 
-        if use_tangent_rotation:
-            # Eq. (8): Chord-aligned tangent rotation & scale clamping in [0.7, 1.4]
-            rotated_tangents = compute_rotated_tangents(ref_pts_for_bridge, curr_local_coords)
-        else:
+        rot_a = _rotated_handles_from_ref(ref_keyframes_map[base_ref], curr_local_coords)
+        if next_ref is not None and base_ref < f < next_ref:
+            rot_b = _rotated_handles_from_ref(ref_keyframes_map[next_ref], curr_local_coords)
+            t = (f - base_ref) / float(next_ref - base_ref)
+            w = 3.0 * t * t - 2.0 * t * t * t
             rotated_tangents = [
                 {
-                    "lt_rel": ref_pts_for_bridge[i]["lt_rel"],
-                    "rt_rel": ref_pts_for_bridge[i]["rt_rel"],
-                    "fc_rel": ref_pts_for_bridge[i]["fc_rel"],
+                    "lt_rel": (
+                        (1.0 - w) * rot_a[i]["lt_rel"][0] + w * rot_b[i]["lt_rel"][0],
+                        (1.0 - w) * rot_a[i]["lt_rel"][1] + w * rot_b[i]["lt_rel"][1],
+                    ),
+                    "rt_rel": (
+                        (1.0 - w) * rot_a[i]["rt_rel"][0] + w * rot_b[i]["rt_rel"][0],
+                        (1.0 - w) * rot_a[i]["rt_rel"][1] + w * rot_b[i]["rt_rel"][1],
+                    ),
+                    "fc_rel": (0.0, 0.0),
                 }
                 for i in range(num_pts)
             ]
+        else:
+            rotated_tangents = rot_a
 
         frame_schema: List[Dict[str, Any]] = []
         for i in range(num_pts):
@@ -942,7 +969,16 @@ class AlphaToRotoPipeline:
 
         for part in roto_project["parts"]:
             pid = int(part["part_id"])
-            master_cps = part["reference_keyframes"][master_frame]
+            num_pts = int(part["num_control_points"])
+            manual_kfs = {
+                int(k): v
+                for k, v in part.get("manual_keyframes", {}).items()
+                if int(k) in frame_set and isinstance(v, list) and len(v) == num_pts
+            }
+            if master_frame in manual_kfs:
+                master_cps = manual_kfs[master_frame]
+            else:
+                master_cps = part["reference_keyframes"][master_frame]
             p_mask_master = part.get("_part_master_mask")
             if p_mask_master is None:
                 p_mask_master = masks[master_idx]
@@ -963,13 +999,16 @@ class AlphaToRotoPipeline:
             for sec_f in linked_masters:
                 if sec_f == master_frame:
                     continue
-                sec_cps = synthesize_linked_master_keyframe_cps(
-                    primary_cps=master_cps,
-                    primary_part_mask=p_mask_master,
-                    sec_part_mask=part_masks_seq[frame_to_idx[sec_f]],
-                    default_tension=tension,
-                    cusp_angle_deg=cusp_angle_deg,
-                )
+                if sec_f in manual_kfs:
+                    sec_cps = manual_kfs[sec_f]
+                else:
+                    sec_cps = synthesize_linked_master_keyframe_cps(
+                        primary_cps=master_cps,
+                        primary_part_mask=p_mask_master,
+                        sec_part_mask=part_masks_seq[frame_to_idx[sec_f]],
+                        default_tension=tension,
+                        cusp_angle_deg=cusp_angle_deg,
+                    )
                 ref_keyframes_map[sec_f] = sec_cps
                 tracks_per_ref[sec_f] = propagate_points_from_reference(
                     sec_cps,
@@ -980,6 +1019,37 @@ class AlphaToRotoPipeline:
                     use_contour_snapping=snap,
                 )
 
+            extra_manual = [mf for mf in sorted(manual_kfs.keys()) if mf not in ref_keyframes_map]
+            if extra_manual:
+                base_blended = blend_multi_ref_tracks(
+                    tracks_per_ref,
+                    ref_frames=sorted(ref_keyframes_map.keys()),
+                    start_f=frame_numbers[0],
+                    end_f=frame_numbers[-1],
+                    blending_mode=b_mode,
+                )
+                for mf in extra_manual:
+                    edited_cps = manual_kfs[mf]
+                    ref_keyframes_map[mf] = edited_cps
+                    m_tracks: Dict[int, Dict[int, Tuple[float, float, float]]] = {
+                        i: {} for i in range(num_pts)
+                    }
+                    for i in range(num_pts):
+                        ex = float(edited_cps[i]["anchor"][0])
+                        ey = float(edited_cps[i]["anchor"][1])
+                        bx_mf, by_mf, _ = base_blended[i][mf]
+                        dx = ex - float(bx_mf)
+                        dy = ey - float(by_mf)
+                        for f in frame_numbers:
+                            if f == mf:
+                                m_tracks[i][f] = (ex, ey, 1.0)
+                            else:
+                                bx, by, bvis = base_blended[i][f]
+                                dist_f = abs(f - mf)
+                                vis_edit = float(np.clip(float(bvis) * np.exp(-dist_f / 25.0), 0.1, 1.0))
+                                m_tracks[i][f] = (float(bx) + dx, float(by) + dy, vis_edit)
+                    tracks_per_ref[mf] = m_tracks
+
             sorted_refs = sorted(ref_keyframes_map.keys())
             blended_tracks = blend_multi_ref_tracks(
                 tracks_per_ref,
@@ -989,6 +1059,7 @@ class AlphaToRotoPipeline:
                 blending_mode=b_mode,
             )
             part["reference_keyframes"] = ref_keyframes_map
+            part["manual_keyframes"] = manual_kfs
             part["tracks_per_ref"] = tracks_per_ref
             part["frames"] = bake_part_frames_with_rotated_tangents(
                 ref_keyframes_map,
@@ -1022,10 +1093,11 @@ class AlphaToRotoPipeline:
                     for pk, pv in p.items():
                         if pk.startswith("_") or (not include_tracks and pk == "tracks_per_ref"):
                             continue
-                        if stringify_frame_keys and pk in ("reference_keyframes", "frames") and isinstance(pv, dict):
+                        if stringify_frame_keys and pk in ("reference_keyframes", "manual_keyframes", "frames") and isinstance(pv, dict):
                             pd[pk] = {str(fk): fv for fk, fv in pv.items()}
                         else:
                             pd[pk] = pv
+                    pd["manual_keyframe_frames"] = sorted(int(k) for k in p.get("manual_keyframes", {}).keys())
                     out_parts.append(pd)
                 out["parts"] = out_parts
             else:
@@ -1121,8 +1193,8 @@ class AlphaToRotoPipeline:
         frame_numbers = roto_project["frame_numbers"]
         masks = roto_project.get("_masks_ref")
 
-        # Store artist-edited keyframe non-destructively
-        part["reference_keyframes"][edited_frame] = [
+        edited_f_int = int(edited_frame)
+        edited_copy = [
             {
                 "index": i,
                 "anchor": [float(cp["anchor"][0]), float(cp["anchor"][1])],
@@ -1131,6 +1203,19 @@ class AlphaToRotoPipeline:
                 "is_keyframe": True,
             }
             for i, cp in enumerate(edited_control_points)
+        ]
+
+        # Store artist-edited keyframe non-destructively & mark as manual keyframe for re-tracking
+        part["reference_keyframes"][edited_f_int] = edited_copy
+        part.setdefault("manual_keyframes", {})[edited_f_int] = [
+            {
+                "index": cp["index"],
+                "anchor": list(cp["anchor"]),
+                "in_handle": list(cp["in_handle"]),
+                "out_handle": list(cp["out_handle"]),
+                "is_keyframe": True,
+            }
+            for cp in edited_copy
         ]
 
         if masks is not None and len(part["reference_keyframes"]) == 1:
@@ -1148,35 +1233,35 @@ class AlphaToRotoPipeline:
                     ]
                 )
             new_ref_tracks = propagate_points_from_reference(
-                part["reference_keyframes"][edited_frame],
-                ref_frame=edited_frame,
+                part["reference_keyframes"][edited_f_int],
+                ref_frame=edited_f_int,
                 frame_numbers=frame_numbers,
                 masks=part_masks_seq,
                 frames_rgb=roto_project.get("_frames_rgb_ref"),
                 use_contour_snapping=self.use_contour_snapping,
             )
         else:
-            # Propagate artist delta offset from the existing tracked trajectory so unedited points
-            # keep their tracked/snapped precision while edited points propagate bidirectionally
-            master_ref = roto_project["master_frame"]
-            base_tracks = part["tracks_per_ref"].get(master_ref)
+            # Propagate artist delta offset from the currently blended trajectory so multi-master
+            # precision on all reference intervals is preserved while edited points shift smoothly.
             new_ref_tracks = {i: {} for i in range(part["num_control_points"])}
-            old_frame_cps = part["frames"][edited_frame]
+            old_frame_cps = part["frames"][edited_f_int]
             for i in range(part["num_control_points"]):
-                dx = float(edited_control_points[i]["anchor"][0]) - float(old_frame_cps[i]["anchor"][0])
-                dy = float(edited_control_points[i]["anchor"][1]) - float(old_frame_cps[i]["anchor"][1])
+                ex = float(edited_copy[i]["anchor"][0])
+                ey = float(edited_copy[i]["anchor"][1])
+                dx = ex - float(old_frame_cps[i]["anchor"][0])
+                dy = ey - float(old_frame_cps[i]["anchor"][1])
                 for f in frame_numbers:
-                    if base_tracks and f in base_tracks[i]:
-                        ox, oy, vis = base_tracks[i][f]
+                    if f == edited_f_int:
+                        new_ref_tracks[i][f] = (ex, ey, 1.0)
                     else:
                         ox, oy = part["frames"][f][i]["anchor"]
                         vis = float(part["frames"][f][i].get("visibility", 1.0))
-                    # Confidence decays gently with temporal distance from edited_frame
-                    dist_f = abs(f - edited_frame)
-                    vis_edit = float(np.clip(vis * np.exp(-dist_f / 25.0), 0.1, 1.0))
-                    new_ref_tracks[i][f] = (float(ox + dx), float(oy + dy), vis_edit)
+                        # Confidence decays gently with temporal distance from edited_frame
+                        dist_f = abs(f - edited_f_int)
+                        vis_edit = float(np.clip(vis * np.exp(-dist_f / 25.0), 0.1, 1.0))
+                        new_ref_tracks[i][f] = (float(ox + dx), float(oy + dy), vis_edit)
 
-        part["tracks_per_ref"][edited_frame] = new_ref_tracks
+        part["tracks_per_ref"][edited_f_int] = new_ref_tracks
         sorted_refs = sorted(part["reference_keyframes"].keys())
 
         # Equations (6) & (7): Multi-Reference Blending (C1 Smoothstep + Visibility or ablation mode)
@@ -1614,7 +1699,7 @@ class AlphaToRotoPipeline:
         payload_json = json.dumps(serializable)
 
         script = f'''"""
-Auto-generated Foundry Nuke Roto Node Builder Script (AlphaToRoto)
+Auto-generated Foundry Nuke Roto Node Builder Script (EditableAlpha)
 Run inside Nuke Script Editor to instantiate the artist-editable multi-part Bezier Roto node.
 """
 import os
@@ -1627,9 +1712,9 @@ REPO_DIR = {repr(repo_dir)}
 ATTACH_AUTOROTO_TAB = {bool(attach_autoroto_tab)}
 ROTO_DATA = json.loads({repr(payload_json)})
 
-def build_alphatoroto_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_TAB):
+def build_editablealpha_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_TAB):
     roto_node = nuke.createNode("Roto", inpanel=False)
-    roto_node.setName("AlphaToRoto_EditableParts")
+    roto_node.setName("EditableAlpha_EditableParts")
     curves_knob = roto_node["curves"]
     root_layer = getattr(curves_knob, "rootLayer", getattr(curves_knob, "root", None))
     w = int(ROTO_DATA["width"])
@@ -1637,7 +1722,7 @@ def build_alphatoroto_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_
     frame_numbers = ROTO_DATA["frame_numbers"]
 
     try:
-        fmt_name = f"AlphaToRoto_{{w}}x{{int(h)}}"
+        fmt_name = f"EditableAlpha_{{w}}x{{int(h)}}"
         nuke.addFormat(f"{{w}} {{int(h)}} 1 {{fmt_name}}")
         roto_node["format"].setValue(fmt_name)
     except Exception:
@@ -1696,7 +1781,7 @@ def build_alphatoroto_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_
                 roto_node["ar_max_parts"].setValue(max(1, len(ROTO_DATA["parts"])))
             if roto_node.knob("ar_status"):
                 roto_node["ar_status"].setValue(
-                    f"Loaded {{len(ROTO_DATA['parts'])}} AlphaToRoto part(s) (Master F{{ROTO_DATA.get('master_frame', 1)}})."
+                    f"Loaded {{len(ROTO_DATA['parts'])}} EditableAlpha part(s) (Master F{{ROTO_DATA.get('master_frame', 1)}})."
                 )
             nuke_bridge.hide_intermediate_native_tabs(roto_node)
             nuke_bridge.make_autoroto_first_tab(roto_node.name(), focus=True)
@@ -1705,15 +1790,181 @@ def build_alphatoroto_node(key_step={int(key_step)}, attach_tab=ATTACH_AUTOROTO_
 
     return roto_node
 
-build_autoroto_node = build_alphatoroto_node
+build_alphatoroto_node = build_editablealpha_node
+build_autoroto_node = build_editablealpha_node
 
 if __name__ == "__main__":
-    build_alphatoroto_node()
+    build_editablealpha_node()
 '''
         os.makedirs(os.path.dirname(os.path.abspath(output_py_path)), exist_ok=True)
         with open(output_py_path, "w", encoding="utf-8") as f:
             f.write(script)
 
+    @staticmethod
+    def format_nuke_nk_node(
+        roto_project: Dict[str, Any],
+        key_step: int = 1,
+        attach_autoroto_tab: bool = True,
+    ) -> str:
+        """
+        Formats the multi-part animated cubic Bezier Roto project into a native Foundry Nuke
+        (.nk / clipboard) node script so artists can paste directly via Ctrl+V or drag-and-drop.
+        """
+        w = int(roto_project["width"])
+        h = float(roto_project["height"])
+        h_int = int(h)
+        cx, cy = w * 0.5, h * 0.5
+        frame_numbers = [int(f) for f in roto_project["frame_numbers"]]
+        all_ref_frames = set()
+        curvegroup_blocks: List[str] = []
 
-# Backwards-compatibility alias
+        def _comp(vals: List[float]) -> str:
+            return "{" + " ".join("{%.4f}" % v for v in vals) + "}"
+
+        def _pt_line(xs: List[float], ys: List[float]) -> str:
+            return "        {" + _comp(xs) + " " + _comp(ys) + " {{0 -}}}"
+
+        for part in roto_project["parts"]:
+            raw_name = str(part.get("name", "Part_01"))
+            shape_name = re.sub(r"[^A-Za-z0-9_]", "_", raw_name) or "Part_01"
+            num_pts = int(part["num_control_points"])
+            ref_set = {int(k) for k in part["reference_keyframes"].keys()}
+            all_ref_frames.update(ref_set)
+
+            sampled_frames = [
+                f_num
+                for idx_f, f_num in enumerate(frame_numbers)
+                if (idx_f % max(1, int(key_step)) == 0)
+                or (f_num in ref_set)
+                or (f_num == frame_numbers[-1])
+            ]
+            if not sampled_frames and frame_numbers:
+                sampled_frames = [frame_numbers[0]]
+
+            frames_hdr = " ".join(str(f) for f in sampled_frames)
+            px_point_lines: List[str] = []
+            p_empty_blocks: List[str] = []
+
+            for i in range(num_pts):
+                lt_x, lt_y = [], []
+                c_x, c_y = [], []
+                rt_x, rt_y = [], []
+                for f_num in sampled_frames:
+                    f_cps = part["frames"].get(f_num)
+                    if f_cps is None:
+                        f_cps = part["frames"][str(f_num)]
+                    cp = f_cps[i]
+                    c_x.append(float(cp["anchor"][0]))
+                    c_y.append(h - float(cp["anchor"][1]))
+                    lt_x.append(float(cp["in_handle"][0]))
+                    lt_y.append(-float(cp["in_handle"][1]))
+                    rt_x.append(float(cp["out_handle"][0]))
+                    rt_y.append(-float(cp["out_handle"][1]))
+
+                px_point_lines.append(_pt_line(lt_x, lt_y))
+                px_point_lines.append(_pt_line(c_x, c_y))
+                px_point_lines.append(_pt_line(rt_x, rt_y))
+                p_empty_blocks.extend(["        {}", "        {}", "        {}"])
+
+            cg_block = "\n".join(
+                [
+                    f"    {{curvegroup {shape_name} 512 bezier",
+                    "     {{cc",
+                    "       {f 8192}",
+                    "       {px",
+                    f"        {{{frames_hdr}}}",
+                    *px_point_lines,
+                    "       }}",
+                    "      {cc",
+                    "       {f 8192}",
+                    "       {p",
+                    *p_empty_blocks,
+                    "       }}}",
+                    "     {tx 1 0}",
+                    f"     {{a osw 10 osf 0 str 1 spx {cx:.4f} spy {cy:.4f} sf 1 sb 1}}}}",
+                ]
+            )
+            curvegroup_blocks.append(cg_block)
+
+        sorted_refs = (
+            sorted(all_ref_frames)
+            if all_ref_frames
+            else [int(roto_project.get("master_frame", frame_numbers[0] if frame_numbers else 1))]
+        )
+        refs_str = ", ".join(str(k) for k in sorted_refs)
+        start_f = int(frame_numbers[0]) if frame_numbers else 1
+        end_f = int(frame_numbers[-1]) if frame_numbers else 1
+        overlap_px = int(roto_project.get("overlap_margin_px", 12))
+        num_parts = max(1, len(roto_project["parts"]))
+        master_f = int(roto_project.get("master_frame", start_f))
+
+        user_knobs_section = ""
+        if attach_autoroto_tab:
+            status_txt = f"Loaded {num_parts} EditableAlpha part(s) (Master F{master_f})."
+            user_knobs_section = "\n".join(
+                [
+                    " addUserKnob {20 EditableAlpha l EditableAlpha}",
+                    ' addUserKnob {26 ar_title l "" +STARTLINE T "<font size=4 color=\\"#e58934\\"><b>EditableAlpha</b></font>"}',
+                    ' addUserKnob {1 ar_ref_frame l "Ref Frame"}',
+                    f' ar_ref_frame "{refs_str}"',
+                    ' addUserKnob {3 ar_start_frame l "Start Frame"}',
+                    f" ar_start_frame {start_f}",
+                    ' addUserKnob {3 ar_end_frame l "End Frame"}',
+                    f" ar_end_frame {end_f}",
+                    ' addUserKnob {3 ar_key_step l "Key Step"}',
+                    f" ar_key_step {max(1, int(key_step))}",
+                    ' addUserKnob {3 ar_max_parts l "Max Parts"}',
+                    f" ar_max_parts {num_parts}",
+                    ' addUserKnob {3 ar_overlap_px l "Seam Overlap (px)"}',
+                    f" ar_overlap_px {overlap_px}",
+                    " addUserKnob {1 ar_status l Status}",
+                    f' ar_status "{status_txt}"',
+                ]
+            )
+
+        lines = [
+            "set cut_paste_input [stack 0]",
+            "version 17.1 v2",
+            "push $cut_paste_input",
+            "Roto {",
+            " output alpha",
+            " curves {{{v x3f99999a}",
+            "  {f 0}",
+            "  {n",
+            "   {layer Root",
+            "    {f 0}",
+            f"    {{t {cx:.4f} {cy:.4f}}}",
+            "    {a}",
+            *curvegroup_blocks,
+            "   }}}}",
+            f' format "{w} {h_int} 0 0 {w} {h_int} 1 EditableAlpha_{w}x{h_int}"',
+            " name EditableAlpha_EditableParts",
+            " selected true",
+        ]
+        if user_knobs_section:
+            lines.append(user_knobs_section)
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def export_to_nuke_nk(
+        roto_project: Dict[str, Any],
+        output_nk_path: str,
+        key_step: int = 1,
+        attach_autoroto_tab: bool = True,
+    ) -> str:
+        """Exports the parametric cubic Bezier Roto project as a native Foundry Nuke .nk node."""
+        nk_text = AlphaToRotoPipeline.format_nuke_nk_node(
+            roto_project,
+            key_step=key_step,
+            attach_autoroto_tab=attach_autoroto_tab,
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(output_nk_path)), exist_ok=True)
+        with open(output_nk_path, "w", encoding="utf-8") as f:
+            f.write(nk_text)
+        return nk_text
+
+
+# Backwards-compatibility & brand aliases
+EditableAlphaPipeline = AlphaToRotoPipeline
 AutoRotoPipeline = AlphaToRotoPipeline

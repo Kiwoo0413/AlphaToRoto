@@ -1,0 +1,73 @@
+#! D:/ProgramFile/Nuke17.1v2/Nuke17.1.exe -nx
+version 17.1 v2
+Gizmo {
+ name EditableAlpha
+ tile_color 0xe58934ff
+ note_font_color 0xffffffff
+ addUserKnob {20 EditableAlpha l EditableAlpha}
+ addUserKnob {26 ea_title l "" +STARTLINE T "<font size=4 color=\"#e58934\"><b>EditableAlpha</b></font> <font color=\"#888\">Mask to Editable Multi-Part Bezier Roto</font>"}
+ addUserKnob {3 ea_start_frame l "Start Frame"}
+ ea_start_frame 1
+ addUserKnob {3 ea_end_frame l "End Frame"}
+ ea_end_frame 100
+ addUserKnob {22 ea_sync_range l "Project Range" -STARTLINE T "import editablealpha_bridge; editablealpha_bridge.on_editablealpha_sync_range(nuke.thisNode())"}
+ addUserKnob {4 ea_mask_channel l "Mask Source" M {"alpha (Input RGBA/Alpha)" "luminance (Input RGB/BW)"}}
+ addUserKnob {3 ea_key_step l "Key Step"}
+ ea_key_step 1
+ addUserKnob {26 ea_div_geom l "" +STARTLINE T "<b><font color=\"#56B4E9\">Part Decomposition &amp; Bezier Fitting</font></b>"}
+ addUserKnob {3 ea_max_parts l "Max Parts"}
+ ea_max_parts 3
+ addUserKnob {3 ea_overlap_px l "Seam Overlap (px)"}
+ ea_overlap_px 12
+ addUserKnob {3 ea_min_pts l "Min Points / Part"}
+ ea_min_pts 8
+ addUserKnob {3 ea_max_pts l "Max Points / Part"}
+ ea_max_pts 16
+ addUserKnob {7 ea_tension l Tension R 0.1 0.8}
+ ea_tension 0.5
+ addUserKnob {7 ea_cusp_angle l "Cusp Angle (deg)" R 25 120}
+ ea_cusp_angle 60
+ addUserKnob {6 ea_auto_multi_master l "Auto Multi-Master" +STARTLINE}
+ ea_auto_multi_master true
+ addUserKnob {1 ea_ref_frames l "Ref Frames (Optional)"}
+ addUserKnob {26 ea_div_out l "" +STARTLINE T "<b><font color=\"#56B4E9\">Conversion &amp; Artist Editing</font></b>"}
+ addUserKnob {4 ea_output_mode l "Output Mode" M {"Update Internal + Extract Roto" "Update Internal Gizmo Only" "Extract Standalone Roto Only"}}
+ addUserKnob {4 ea_view_mode l Preview M {"Converted Roto" "Input Mask"}}
+ addUserKnob {22 ea_convert_btn l "<b><font color=\"#56B4E9\">Convert Mask to Roto</font></b>" +STARTLINE T "import editablealpha_bridge; editablealpha_bridge.on_editablealpha_convert(nuke.thisNode())"}
+ addUserKnob {22 ea_extract_btn l "Extract Editable Roto" -STARTLINE T "import editablealpha_bridge; editablealpha_bridge.on_editablealpha_extract_roto(nuke.thisNode())"}
+ addUserKnob {22 ea_retrack_btn l "Re-Track (Keep Manual Edits)" -STARTLINE T "import editablealpha_bridge; editablealpha_bridge.on_editablealpha_retrack_manual(nuke.thisNode())"}
+ addUserKnob {1 ea_status l Status}
+ ea_status "Ready. Connect a mask input and click Convert Mask to Roto."
+ addUserKnob {2 ea_python_path l "Worker Python"}
+ addUserKnob {22 ea_check_env l "Check Worker Env" -STARTLINE T "import editablealpha_bridge; editablealpha_bridge.check_environment_status(nuke.thisNode())"}
+ addUserKnob {1 ea_last_project_json l "" +INVISIBLE}
+}
+ Input {
+  inputs 0
+  name mask
+  xpos 0
+  ypos -180
+ }
+ set N_ea_mask_in [stack 0]
+ Roto {
+  inputs 1
+  output alpha
+  replace true
+  name EditableAlpha_Roto
+  xpos -80
+  ypos -60
+ }
+ push $N_ea_mask_in
+ Switch {
+  inputs 2
+  which {{parent.ea_view_mode}}
+  name ViewSwitch
+  xpos 0
+  ypos 60
+ }
+ Output {
+  name Output1
+  xpos 0
+  ypos 160
+ }
+end_group
