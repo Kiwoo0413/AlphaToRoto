@@ -27,10 +27,12 @@ nuke.pluginAddPath(r"E:\AlphaToRoto")
 
 ## 2. 사용 방법 (Mask Input ➔ Editable Roto)
 
+![EditableAlpha Nuke Properties UI](assets/editablealpha_properties_ui.png)
+
 1. Nuke 그래프에서 알파 마스크 노드(예: `Read`, `Keylight`, `SAM2`/`AlphaGen` 출력 등)를 선택하고 **`Ctrl+Alt+E`** (또는 `Tab` → `EditableAlpha`)로 노드를 생성해 입력(`mask`)에 연결합니다.
-2. **`Project Range`** 버튼을 눌러 입력 시퀀스 프레임 범위(`Start Frame` / `End Frame`)를 맞춥니다.
+2. **`Sync Range`** 버튼을 눌러 입력 시퀀스 프레임 범위(`Start Frame` / `End Frame`)를 맞춥니다.
 3. 필요 시 파라미터를 조정합니다:
-   - **Mask Source**: `alpha (Input RGBA/Alpha)` 또는 `luminance (Input RGB/BW)`
+   - **Mask Source**: `Alpha (RGBA Input)` 또는 `Luminance (RGB/BW)`
    - **Max Parts / Seam Overlap (px)**: 관절 단위 파트 분할 개수 및 이음새 겹침 마진(기본 `12 px`)
    - **Min / Max Points / Part**: 파트당 제어점 개수
    - **Auto Multi-Master**: 움직임이 큰 시퀀스에서 대표 기준 프레임을 자동 다중 선출
@@ -39,8 +41,8 @@ nuke.pluginAddPath(r"E:\AlphaToRoto")
      - `Update Internal Gizmo Only`: Gizmo 내부 Roto만 갱신
      - `Extract Standalone Roto Only`: 독립 `Roto` 노드만 생성/갱신
    - **Preview**: `Converted Roto` / `Input Mask` A/B 전환
-4. **`Convert Mask to Roto`** 클릭 → 입력 마스크가 편집 가능한 다중 파트 베지에 `Roto` 노드로 변환됩니다.
-5. **수동 수정 후 재추적**: 추출된 `Roto` 노드에서 현재 프레임의 제어점/핸들을 직접 수정한 뒤, Gizmo의 **`Re-Track (Keep Manual Edits)`** 를 누르면 수정한 제어점이 100% 보존된 상태로 인접 프레임이 부드럽게 재추적됩니다.
+4. **`▶ Convert Mask to Roto`** 클릭 → 입력 마스크가 편집 가능한 다중 파트 베지에 `Roto` 노드로 변환됩니다.
+5. **수동 수정 후 재추적**: 추출된 `Roto` 노드에서 현재 프레임의 제어점/핸들을 직접 수정한 뒤, Gizmo의 **`Re-Track (Keep Edits)`** 를 누르면 수정한 제어점이 100% 보존된 상태로 인접 프레임이 부드럽게 재추적됩니다.
 
 ---
 
