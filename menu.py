@@ -12,14 +12,3 @@ ea_menu.addCommand(
     "editablealpha_bridge.create_editablealpha_gizmo()",
     shortcut="Ctrl+Alt+E",
 )
-
-top_menu = nuke.menu("Nuke").addMenu("&EditableAlpha")
-top_menu.addCommand(
-    "Create EditableAlpha Gizmo",
-    "editablealpha_bridge.create_editablealpha_gizmo()",
-    shortcut="Ctrl+Alt+E",
-)
-top_menu.addCommand(
-    "Check Worker Python Environment",
-    "editablealpha_bridge.check_environment_status()",
-)

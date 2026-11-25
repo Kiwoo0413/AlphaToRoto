@@ -35,14 +35,13 @@ Nuke 내장 Python(NumPy/OpenCV 미설치 환경)과의 충돌을 피하기 위�
 
 ```python
 import nuke
-nuke.pluginAddPath(r"C:\Users\<사용자명>\.nuke\AlphaToRoto")
+nuke.pluginAddPath('./AlphaToRoto')
 ```
 
-*(또는 `~/.nuke` 내부에 위치한 경우 `nuke.pluginAddPath('AlphaToRoto')`)*
+*(또는 절대 경로: `nuke.pluginAddPath(r"C:\Users\<사용자명>\.nuke\AlphaToRoto")`)*
 
 - **툴바 메뉴**: `Nodes > EditableAlpha > EditableAlpha (Mask to Roto)`
 - **단축키**: `Ctrl+Alt+E`
-- **상단 메뉴**: `EditableAlpha > Check Worker Python Environment` (외부 Python `cv2`/`numpy` 연결 상태 확인)
 
 ---
 
@@ -103,9 +102,9 @@ python -m unittest discover -s tests -v
   <a href="#korean"><b>🌐 한국어로 전환 (Switch to Korean)</b></a>
 </p>
 
-**EditableAlpha** is a **Foundry Nuke 17.1+ Gizmo tool** that takes a raster alpha mask (matte or RGBA sequence) as input and automatically converts it into **multi-part Cubic Bézier Roto shapes**.
+**EditableAlpha** is a **Foundry Nuke 17.1+ Gizmo tool** that converts raster alpha masks (matte / RGBA sequences) into **multi-part, artist-editable Cubic Bézier Roto shapes**.
 
-To avoid dependency conflicts with Nuke's bundled Python (which lacks NumPy/OpenCV), Nuke runs only a pure standard-library bridge ([editablealpha_bridge.py](editablealpha_bridge.py)) internally, while offloading heavy geometry and tracking computation to an external Python worker subprocess ([editablealpha_worker.py](editablealpha_worker.py)).
+To avoid dependency conflicts with Nuke's bundled Python (which ships without NumPy or OpenCV), only a pure-stdlib bridge ([editablealpha_bridge.py](editablealpha_bridge.py)) runs inside Nuke, while heavy geometry decomposition and tracking run in an isolated external Python worker subprocess ([editablealpha_worker.py](editablealpha_worker.py)).
 
 ![EditableAlpha Mask-to-Roto Preview](assets/editablealpha_preview.png)
 
@@ -115,18 +114,17 @@ To avoid dependency conflicts with Nuke's bundled Python (which lacks NumPy/Open
 
 ## 1. Nuke Installation (1-Line Setup)
 
-Add the following two lines to `~/.nuke/init.py` (e.g. `C:\Users\<Username>\.nuke\init.py` on Windows) so `EditableAlpha.gizmo`, menus, and shortcuts are registered automatically on Nuke startup:
+Add the following two lines to `~/.nuke/init.py` (e.g., `C:\Users\<Username>\.nuke\init.py` on Windows) to automatically register `EditableAlpha.gizmo`, menus, and hotkeys on Nuke startup:
 
 ```python
 import nuke
-nuke.pluginAddPath(r"C:\Users\<Username>\.nuke\AlphaToRoto")
+nuke.pluginAddPath('./AlphaToRoto')
 ```
 
-*(Or `nuke.pluginAddPath('AlphaToRoto')` if placed directly inside `~/.nuke`)*
+*(Or use an absolute path: `nuke.pluginAddPath(r"C:\Users\<Username>\.nuke\AlphaToRoto")`)*
 
 - **Toolbar Menu**: `Nodes > EditableAlpha > EditableAlpha (Mask to Roto)`
 - **Shortcut**: `Ctrl+Alt+E`
-- **Top Menu**: `EditableAlpha > Check Worker Python Environment` (verifies external Python `cv2`/`numpy` availability)
 
 ---
 
@@ -134,38 +132,38 @@ nuke.pluginAddPath(r"C:\Users\<Username>\.nuke\AlphaToRoto")
 
 ![EditableAlpha Nuke Properties UI](assets/editablealpha_properties_ui.png)
 
-1. Select an alpha mask node in the Nuke Node Graph (e.g., `Read`, `Keylight`, `SAM2`/`AlphaGen` output), press **`Ctrl+Alt+E`** (or `Tab` → `EditableAlpha`), and connect it to the `mask` input.
-2. Click **`Sync Range`** to match `Start Frame` / `End Frame` to the connected input sequence.
+1. In the Nuke Node Graph, select an alpha mask node (e.g., `Read`, `Keylight`, `SAM2`/`AlphaGen` output) and press **`Ctrl+Alt+E`** (or `Tab` → `EditableAlpha`) to create and connect the Gizmo to its `mask` input.
+2. Click **`Sync Range`** to match `Start Frame` and `End Frame` to the connected input sequence or project settings.
 3. Adjust parameters as needed:
    - **Mask Source**: `Alpha (RGBA Input)` or `Luminance (RGB/BW)`
-   - **Max Parts / Seam Overlap (px)**: Maximum articulated part count and overlap margin between adjacent parts (default: `12 px`)
-   - **Min / Max Points / Part**: Control point budget per part
-   - **Auto Multi-Master**: Automatically selects multiple master keyframes across sequences with large motion
+   - **Max Parts / Seam Overlap (px)**: Number of articulated sub-parts and overlap margin between adjacent parts to prevent seam gaps (default: `12 px`)
+   - **Min / Max Points / Part**: Control point budget per Bezier part
+   - **Auto Multi-Master**: Automatically selects multiple master reference frames for sequences with large motion or topology changes
    - **Output Mode**:
-     - `Update Internal + Extract Roto` *(Default)*: Updates the internal Roto node and extracts a standalone `Roto` node into the graph
+     - `Update Internal + Extract Roto` *(default)*: Updates the internal Gizmo Roto and extracts/updates a standalone `Roto` node in the Node Graph
      - `Update Internal Gizmo Only`: Updates only the internal Gizmo Roto
-     - `Extract Standalone Roto Only`: Creates/updates only the standalone `Roto` node
-   - **Preview**: Toggle between `Converted Roto` and `Input Mask`
-4. Click **`▶ Convert Mask to Roto`** to convert the input mask into editable multi-part Bézier `Roto` curves.
-5. **Re-Tracking After Manual Edits**: Adjust control points or tangent handles directly on the extracted `Roto` node at the current frame, then click **`Re-Track (Keep Edits)`** on the Gizmo to smoothly re-track adjacent frames while preserving your manual edits 100%.
+     - `Extract Standalone Roto Only`: Creates or updates only the standalone `Roto` node
+   - **Preview**: A/B toggle between `Converted Roto` and `Input Mask`
+4. Click **`▶ Convert Mask to Roto`** to convert the input mask sequence into multi-part editable Cubic Bézier `Roto` curves.
+5. **Re-Track While Preserving Manual Edits**: Manually adjust control points or tangent handles on the current frame in the extracted `Roto` node, then click **`Re-Track (Keep Edits)`** on the Gizmo. Your manual edits are preserved 100% while adjacent frames are smoothly re-tracked.
 
 ---
 
 ## 3. Sample Test Sequences
 
-A 15-frame test sequence is included in the repository so you can load it via a Nuke `Read` node and connect it directly to `EditableAlpha`'s `mask` input:
+Load the included 15-frame test sequences with a Nuke `Read` node and connect them directly to the `EditableAlpha` `mask` input for immediate testing.
 
-| Category | Path | Description | Preview (F5) |
+| Type | Path | Description | Preview (F5) |
 | :--- | :--- | :--- | :---: |
-| **Nuke RGBA Test** | `sample_sequences/rgba_nuke/rgba_####.png` | Ready-to-use RGBA sequence with embedded Alpha (`1–15f`) | ![Sample RGB](sample_sequences/rgb/frame_0005.png) |
-| **Binary Mask** | `sample_sequences/masks/mask_####.png` | Grayscale binary mask sequence (`1–15f`, `Mask Source: Luminance` or `Alpha`) | ![Sample Mask](sample_sequences/masks/mask_0005.png) |
+| **Nuke RGBA Test** | `sample_sequences/rgba_nuke/rgba_####.png` | Ready-to-use RGBA sequence with embedded Alpha channel (`1–15f`) | ![Sample RGB](sample_sequences/rgb/frame_0005.png) |
+| **Binary Mask** | `sample_sequences/masks/mask_####.png` | Black-and-white alpha mask sequence (`1–15f`, `Mask Source: Luminance` or `Alpha`) | ![Sample Mask](sample_sequences/masks/mask_0005.png) |
 | **Source RGB Plate** | `sample_sequences/rgb/frame_####.png` | Original RGB plate sequence with background (`1–15f`) | — |
 
 ---
 
 ## 4. Headless Testing
 
-You can verify the worker subprocess, Gizmo syntax/knobs, manual edit preservation, and Roto coordinate round-trips without launching the Nuke GUI:
+Validate the worker subprocess, Gizmo syntax, manual edit preservation, and Nuke Roto coordinate round-trip without launching the Nuke GUI:
 
 ```bash
 python -m unittest discover -s tests -v
