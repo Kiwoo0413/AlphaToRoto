@@ -4,6 +4,8 @@
 
 Nuke 내장 Python(NumPy/OpenCV 미설치 환경)과의 충돌을 피하기 위해, Nuke 내부에서는 순수 표준 라이브러리 브리지([editablealpha_bridge.py](file:///e:/AlphaToRoto/editablealpha_bridge.py))만 동작하고 무거운 기하·추적 연산은 외부 Python 워커([editablealpha_worker.py](file:///e:/AlphaToRoto/editablealpha_worker.py)) 서브프로세스로 분리 실행합니다.
 
+![EditableAlpha Mask-to-Roto Preview](assets/editablealpha_preview.png)
+
 ---
 
 ## 1. Nuke 설치 방법 (1줄 등록)
@@ -40,7 +42,19 @@ nuke.pluginAddPath(r"E:\AlphaToRoto")
 
 ---
 
-## 3. 헤드리스 테스트 실행
+## 3. 테스트 샘플 이미지 (Sample Test Sequences)
+
+저장소에 포함된 15프레임 테스트 시퀀스를 Nuke `Read` 노드로 불러와 `EditableAlpha` 입력(`mask`)에 바로 연결해 테스트할 수 있습니다.
+
+| 구분 | 경로 | 설명 | 미리보기 (F5) |
+| :--- | :--- | :--- | :---: |
+| **Nuke RGBA 테스트** | `sample_sequences/rgba_nuke/rgba_####.png` | `Read` 노드에 연결 즉시 Alpha 채널이 포함된 테스트 시퀀스 (`1–15f`) | ![Sample RGB](sample_sequences/rgb/frame_0005.png) |
+| **바이너리 마스크** | `sample_sequences/masks/mask_####.png` | 흑백 알파 마스크 시퀀스 (`1–15f`, `Mask Source: luminance` 또는 `alpha`) | ![Sample Mask](sample_sequences/masks/mask_0005.png) |
+| **원본 RGB 플레이트** | `sample_sequences/rgb/frame_####.png` | 배경이 포함된 원본 RGB 이미지 시퀀스 (`1–15f`) | — |
+
+---
+
+## 4. 헤드리스 테스트 실행
 
 Nuke GUI를 켜지 않고도 워커 서브프로세스, Gizmo 구조, 수동 수정 보존, Roto 좌표 변환을 검증할 수 있습니다.
 
